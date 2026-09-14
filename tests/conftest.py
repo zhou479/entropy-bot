@@ -2,6 +2,15 @@ from __future__ import annotations
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch):
+    """防止测试意外请求实盘 API；模拟器可在单个测试覆盖此方法。"""
+    def refused(*args, **kwargs):
+        raise AssertionError("Network is disabled in tests")
+    monkeypatch.setattr("requests.sessions.Session.request", refused)
+    monkeypatch.setattr("socket.socket.connect", refused)
+
 from entropy_bot.coins import resolve_markets
 
 PERP_DEXS = [None] + [
