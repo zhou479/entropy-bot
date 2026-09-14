@@ -10,6 +10,7 @@ open order on the master account, not just io:ANTH / io:SNDK.
 from __future__ import annotations
 
 import logging
+import math
 import signal
 import threading
 import time
@@ -45,7 +46,10 @@ from entropy_bot.quoting import (
     sync_pos_since,
 )
 from entropy_bot.diagnostics import BookSnap, FillDiagnostics, snap_from_top
-from entropy_bot.errors import RateLimited, RequestWeightLimited, is_weight_limit_error
+from entropy_bot.errors import (ExchangeOutcomeUnknown, LiveGuardError, RateLimited,
+                                RequestWeightLimited, is_weight_limit_error)
+from entropy_bot.safety import (BUDGET_POLL_S, HTTP_BACKOFF_S, LIMITED_EXIT_GAP_S,
+                                RequestBudget, cancel_confirmed)
 from entropy_bot.rest import InfoClient
 from entropy_bot.status import load_io_markets
 from entropy_bot.ws import BookFeed
@@ -54,14 +58,14 @@ log = logging.getLogger("entropy_bot.live")
 
 WS_STALE_S = 15.0
 POS_POLL_S = 0.8
-FILL_POLL_S = 2.0
+FILL_POLL_S = 30.0  # WS 保持逐笔诊断；REST 仅低频补漏，避免抢占查询权重。
 LOOP_S = 0.4
 DEADMAN_AHEAD_MS = 20_000
 DEADMAN_MIN_MS = 5_000
 DEADMAN_FALLBACK_MS = 6_000
 DEADMAN_REMAIN_LT_S = 8.0
 DEADMAN_REFRESH_S = DEADMAN_REMAIN_LT_S  # alias: refresh only when remaining < 8s
-IOC_GAP_S = 0.4
+IOC_GAP_S = 3.0  # 首次退出仍是 >=15s；后续重试共享节流，避免 info 查询耗尽 IP 权重。
 WEIGHT_BACKOFF_FLOOR_S = 30.0
 
 
@@ -184,7 +188,7 @@ def list_cached_cloids(rests: dict[str, dict[str, RestSlot]], coin: str) -> list
     out: list[str] = []
     for side in ("B", "A"):
         slot = rests.get(coin, {}).get(side)
-        if slot and slot.cloid:
+        if slot and slot.cloid and slot.oid is None:
             out.append(slot.cloid)
     return out
 
@@ -198,13 +202,15 @@ def positions_from_state(
     coins: tuple[str, ...],
     markets: dict[str, Market],
 ) -> dict[str, float] | None:
-    if state is None:
+    if not isinstance(state, dict):
         return None
     out = {coin: 0.0 for coin in coins}
     rows = state.get("assetPositions")
     if not isinstance(rows, list):
         return None
     for item in rows:
+        if not isinstance(item, dict) or not isinstance(item.get("position"), dict):
+            return None
         pos = (item or {}).get("position") or {}
         coin = match_order_coin({"coin": pos.get("coin"), "a": None}, markets)
         if coin is None or coin not in out:
@@ -214,9 +220,11 @@ def positions_from_state(
             else:
                 continue
         try:
-            out[coin] = float(pos.get("szi") or 0)
-        except (TypeError, ValueError):
-            out[coin] = 0.0
+            out[coin] = float(pos["szi"])
+            if not math.isfinite(out[coin]):
+                return None
+        except (KeyError, TypeError, ValueError):
+            return None
     return out
 
 
@@ -290,6 +298,21 @@ class LiveQuoter:
     books: dict[str, tuple[float, dict[str, Any]]] = field(default_factory=dict)
     diag: FillDiagnostics | None = None
     _feed: BookFeed | None = None
+    budget: RequestBudget = field(default_factory=RequestBudget)
+    last_budget_poll: float = 0.0
+    positions_valid: bool = False
+    last_position_success: float = 0.0
+    entry_halt: str = ""
+    unknown_write: bool = False
+    http_backoff_until: float = 0.0
+    next_exit_at: float = 0.0
+    next_cancel_at: float = 0.0
+    next_deadman_at: float = 0.0
+    managed_started: bool = False
+    shutting_down: bool = False
+    _fill_generation: int = 0
+    _position_generation: int = -1
+    next_safety_poll: dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.notional:
@@ -314,16 +337,60 @@ class LiveQuoter:
         return time.time() < self._weight_backoff_until
 
     def _trip_weight_backoff(self, err: object) -> None:
+        self.halt_entries("cumulative request limit; manual review required before restart")
+        self.budget.valid = False
+        self.next_exit_at = max(self.next_exit_at, time.time() + LIMITED_EXIT_GAP_S)
         wait = weight_backoff_s(self.settings.min_replace_s)
         self._weight_backoff_until = time.time() + wait
         if not self._weight_logged:
             log.warning(
-                "request weight exhausted; backing off signed writes for %.0fs "
-                "(waiting does not restore the cap): %s",
+                "request weight exhausted; entries latched OFF, maintenance backoff %.0fs "
+                "(cancel/exit use separate paced paths; waiting does not restore cap): %s",
                 wait,
                 err,
             )
             self._weight_logged = True
+
+    def halt_entries(self, reason: str) -> None:
+        if not self.entry_halt:
+            self.entry_halt = reason
+            log.error("SAFETY entry_halt=%s", reason)
+
+    def refresh_budget(self, *, force: bool = False) -> None:
+        now = time.time()
+        if not force and now - self.last_budget_poll < BUDGET_POLL_S:
+            return
+        self.last_budget_poll = now
+        try:
+            raw = self.client.user_rate_limit(self.signer.account)
+            self.budget.update(raw, time.time())
+        except Exception:
+            self.budget.valid = False
+        if self.budget.valid and not self.budget.can_enter(time.time(), len(self.markets)):
+            self.halt_entries("request reserve too low; no automatic quota purchase")
+
+    def position_fresh(self) -> bool:
+        with self._lock:
+            unchanged = self._position_generation == self._fill_generation
+        return (self.positions_valid and unchanged
+                and 0 <= time.time() - self.last_position_success <= 3.0)
+
+    def entry_allowed(self) -> bool:
+        return (not self.entry_halt and not self.unknown_write and not self.shutting_down
+                and self.position_fresh()
+                and self.budget.can_enter(time.time(), len(self.markets)))
+
+    def preflight(self) -> None:
+        """启动阶段只有查询；拒绝接管已有仓位/挂单，避免误管手工交易。"""
+        self.refresh_positions(force=True)
+        opens = self.client.open_orders(self.signer.account, ALLOWED_DEX, optional=True)
+        self.refresh_budget(force=True)
+        if not self.position_fresh() or opens is None:
+            raise LiveGuardError("preflight: account state unavailable; no signed actions sent")
+        if any(self.pos.values()) or opens:
+            raise LiveGuardError("preflight: verify existing positions/orders manually; start flat and empty")
+        if not self.entry_allowed():
+            raise LiveGuardError("preflight: request budget unknown/insufficient; no signed actions sent")
 
     def _mark_replaced(self, coin: str) -> None:
         self.last_replace[coin] = time.time()
@@ -362,6 +429,9 @@ class LiveQuoter:
             log.warning("fill-diag quotes: %s", exc)
 
     def on_user_fills(self, data: dict[str, Any]) -> None:
+        if isinstance(data, dict) and data.get("fills"):
+            with self._lock:
+                self._fill_generation += 1
         if self.diag is None:
             return
         fills = data.get("fills") if isinstance(data, dict) else None
@@ -409,7 +479,9 @@ class LiveQuoter:
                 flush=True,
             )
             payload = self.signer.signed_update_leverage(market, self.settings.max_leverage)
-            resp = self.client.post_exchange(payload)
+            resp = self._post(payload)
+            if not isinstance(resp, dict) or resp.get("status") != "ok":
+                raise LiveGuardError("isolated leverage update rejected; startup stopped")
             log.info("isolated leverage %s -> %s", market.coin, resp)
 
     def _fee_banner(self, coin: str) -> None:
@@ -427,6 +499,9 @@ class LiveQuoter:
         now = time.time()
         if not force and now - self.last_pos_poll < POS_POLL_S:
             return
+        self.positions_valid = False
+        with self._lock:
+            generation = self._fill_generation
         state = self.client.clearinghouse_state(self.signer.account, ALLOWED_DEX, optional=True)
         parsed = positions_from_state(state, tuple(self.markets), self.markets)
         if parsed is None:
@@ -438,6 +513,9 @@ class LiveQuoter:
         self.pos_since = sync_pos_since(self.pos, parsed, self.pos_since, now)
         self.pos = parsed
         self.last_pos_poll = now
+        self.last_position_success = time.time()
+        self.positions_valid = True
+        self._position_generation = generation
 
     def book_for(self, coin: str, feed: BookFeed | None) -> BookTop | None:
         now = time.time()
@@ -459,9 +537,20 @@ class LiveQuoter:
                     self.books[coin] = (ts, data)
             except Exception as exc:  # noqa: BLE001
                 log.warning("REST l2Book fallback failed %s: %s", coin, exc)
-                if data is None:
+                return None
+        top = book_top(coin, data or {})
+        if (top.bid is None or top.ask is None or not math.isfinite(top.bid)
+                or not math.isfinite(top.ask) or not 0 < top.bid < top.ask):
+            return None
+        # 接收时间新鲜，不代表服务器快照新鲜。
+        if top.time is not None:
+            try:
+                age = time.time() - float(top.time) / 1000
+                if not math.isfinite(age) or not -5 <= age <= WS_STALE_S:
                     return None
-        return book_top(coin, data or {})
+            except (TypeError, ValueError):
+                return None
+        return top
 
     def plan_for(self, coin: str, top: BookTop) -> QuotePlan:
         now = time.time()
@@ -476,24 +565,42 @@ class LiveQuoter:
             notional_usd=self.notional,
         )
 
-    def _post(self, payload: dict[str, Any]) -> Any:
-        if self._in_weight_backoff():
+    def _post(self, payload: dict[str, Any], *, purpose: str = "maintenance", actions: int = 1) -> Any:
+        now = time.time()
+        if now < self.http_backoff_until:
+            raise RateLimited("local HTTP backoff")
+        if purpose == "entry" and not self.entry_allowed():
+            raise RequestWeightLimited("entry safety gate closed")
+        if purpose == "exit" and (self.unknown_write or now < self.next_exit_at):
+            raise RateLimited("exit awaits reconciliation or paced retry")
+        if purpose == "cancel" and now < self.next_cancel_at:
+            raise RateLimited("cancel paced retry")
+        if purpose == "maintenance" and (self.entry_halt or self._in_weight_backoff()):
             left = self._weight_backoff_until - time.time()
             raise RequestWeightLimited(f"signed write skipped; request-weight backoff {left:.1f}s left")
+        if purpose == "exit":
+            self.next_exit_at = now + (LIMITED_EXIT_GAP_S if self.entry_halt else IOC_GAP_S)
+        self.budget.debit(actions)
+        log.info("EXEC action=%s purpose=%s local_debit=%d", payload.get("action", {}).get("type"), purpose, actions)
         try:
             resp = self.client.post_exchange(payload)
         except RequestWeightLimited as exc:
             self._trip_weight_backoff(exc)
+            if purpose == "cancel":
+                self.next_cancel_at = time.time() + LIMITED_EXIT_GAP_S
             raise
         except RateLimited as exc:
+            self.http_backoff_until = time.time() + HTTP_BACKOFF_S
             if is_weight_limit_error(exc):
                 self._trip_weight_backoff(exc)
             raise
         except Exception as exc:  # noqa: BLE001
+            self.unknown_write = True
+            self.halt_entries("exchange write outcome unknown; reconcile manually, do not restart blindly")
             if is_weight_limit_error(exc):
                 self._trip_weight_backoff(exc)
             raise
-        if is_weight_limit_error(resp):
+        if isinstance(resp, dict) and resp.get("status") == "err" and is_weight_limit_error(resp):
             exc = RequestWeightLimited(str(resp))
             self._trip_weight_backoff(exc)
             raise exc
@@ -503,9 +610,15 @@ class LiveQuoter:
 
     def schedule_deadman(self, ahead_ms: int = DEADMAN_AHEAD_MS) -> None:
         """Account-wide: cancels ALL open orders on the master when it fires."""
+        if time.time() < self.next_deadman_at:
+            return
+        self.next_deadman_at = time.time() + HTTP_BACKOFF_S
         deadline = deadman_deadline_ms(ahead_ms)
         try:
             resp = self._post(self.signer.signed_schedule_cancel(deadline))
+            if not isinstance(resp, dict) or resp.get("status") != "ok":
+                self.halt_entries("dead-man rejected; no confirmed protection")
+                return
             now = time.time()
             self.last_deadman = now
             self.deadman_until = deadline / 1000.0
@@ -513,18 +626,13 @@ class LiveQuoter:
         except RequestWeightLimited:
             return
         except RateLimited:
-            if self._in_weight_backoff():
-                return
-            fallback = deadman_deadline_ms(DEADMAN_FALLBACK_MS)
-            resp = self._post(self.signer.signed_schedule_cancel(fallback))
-            now = time.time()
-            self.last_deadman = now
-            self.deadman_until = fallback / 1000.0
-            log.warning("dead-man 429; fallback +%ss account-wide -> %s", DEADMAN_FALLBACK_MS // 1000, resp)
+            log.warning("dead-man rate limited; no immediate fallback retry")
 
     def maybe_deadman(self) -> None:
         now = time.time()
-        if self._in_weight_backoff():
+        if self.entry_halt or self.shutting_down or self._in_weight_backoff():
+            return
+        if not self.entry_allowed() and not any(self._has_rest(c) for c in self.markets):
             return
         if not deadman_needs_refresh(self.deadman_until, now):
             return
@@ -539,11 +647,15 @@ class LiveQuoter:
             log.warning("dead-man renew failed: %s", exc)
             self.last_deadman = now
             # Do not tight-loop: wait at least MIN_REPLACE_S before another attempt.
-            self.deadman_until = now + max(self.settings.min_replace_s, DEADMAN_REMAIN_LT_S)
+            self.next_deadman_at = now + max(self.settings.min_replace_s, HTTP_BACKOFF_S)
 
     def clear_deadman(self) -> None:
         try:
             resp = self._post(self.signer.signed_schedule_cancel(None))
+            if not isinstance(resp, dict) or resp.get("status") != "ok":
+                log.error("dead-man clear rejected; existing deadline remains unconfirmed")
+                return
+            self.deadman_until = 0.0
             log.info("dead-man scheduleCancel cleared (no time) -> %s", resp)
         except RateLimited:
             self.schedule_deadman(DEADMAN_FALLBACK_MS)
@@ -555,9 +667,13 @@ class LiveQuoter:
         ok = True
         if oids:
             try:
-                resp = self._post(self.signer.signed_cancel_oids([(market.asset_id, oid) for oid in oids]))
+                resp = self._post(self.signer.signed_cancel_oids([(market.asset_id, oid) for oid in oids]),
+                                  purpose="cancel", actions=len(oids))
                 log.info("cancel oids %s %s -> %s", coin, oids, resp)
-                if not action_ok(resp):
+                if is_weight_limit_error(resp):
+                    self._trip_weight_backoff(resp)
+                    self.next_cancel_at = time.time() + LIMITED_EXIT_GAP_S
+                if not cancel_confirmed(resp, len(oids)):
                     ok = False
             except RateLimited:
                 log.warning("cancel oids 429 %s", coin)
@@ -567,24 +683,35 @@ class LiveQuoter:
                 ok = False
         if cloids:
             try:
-                resp = self._post(self.signer.signed_cancel_cloids([(market.asset_id, c) for c in cloids]))
+                resp = self._post(self.signer.signed_cancel_cloids([(market.asset_id, c) for c in cloids]),
+                                  purpose="cancel", actions=len(cloids))
                 log.info("cancel cloids %s -> %s", coin, resp)
+                if is_weight_limit_error(resp):
+                    self._trip_weight_backoff(resp)
+                    self.next_cancel_at = time.time() + LIMITED_EXIT_GAP_S
+                if not cancel_confirmed(resp, len(cloids)):
+                    ok = False
             except Exception as exc:  # noqa: BLE001
                 log.warning("cancel cloids %s: %s", coin, exc)
                 ok = False
         return ok
 
-    def cancel_coin_rests(self, *, refetch: bool = True) -> dict[str, Any]:
+    def cancel_coin_rests(self, *, refetch: bool = True, only_coin: str | None = None) -> dict[str, Any]:
         """Cancel cache then refetch frontendOpenOrders dex:io. 429 does not empty cache."""
         limited = False
+        known = {oid for c in self.markets for oid in list_cached_oids(self.rests, self.extra_oids, c)}
         for coin in self.markets:
+            if only_coin is not None and coin != only_coin:
+                continue
             oids = list_cached_oids(self.rests, self.extra_oids, coin)
             cloids = list_cached_cloids(self.rests, coin)
             if oids or cloids:
                 try:
-                    self._cancel_pairs(coin, oids, cloids)
-                    clear_coin_rests(self.rests, coin)
-                    self.extra_oids[coin] = []
+                    if self._cancel_pairs(coin, oids, cloids):
+                        clear_coin_rests(self.rests, coin)
+                        self.extra_oids[coin] = []
+                    else:
+                        limited = True
                 except RateLimited:
                     limited = True
                     log.warning("cancel cache 429 %s; keeping rest cache", coin)
@@ -593,28 +720,29 @@ class LiveQuoter:
         opens = self.client.open_orders(self.signer.account, ALLOWED_DEX, optional=True)
         if opens is None:
             log.warning("frontendOpenOrders null/429; not wiping rest cache")
-            try:
-                self.schedule_deadman(DEADMAN_FALLBACK_MS)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("429 fallback scheduleCancel failed: %s", exc)
             return {"rateLimited": True, "cachePreserved": True}
+        # 只接管 EBOT 标记或本进程已知的订单，不撤手工/其他机器人的订单。
+        foreign = [o for o in opens if match_order_coin(o, self.markets) is not None
+                   and not is_bot_cloid(o.get("cloid")) and o.get("oid") not in known]
+        if foreign:
+            self.halt_entries("unmanaged open orders detected; exclusive account required")
+        opens = [o for o in opens if is_bot_cloid(o.get("cloid")) or o.get("oid") in known]
         self.rests, self.extra_oids = apply_open_orders(self.rests, self.extra_oids, opens, self.markets)
-        for coin in self.markets:
-            oids = list_cached_oids(self.rests, self.extra_oids, coin)
-            cloids = list_cached_cloids(self.rests, coin)
-            if not oids and not cloids:
-                continue
-            try:
-                self._cancel_pairs(coin, oids, cloids)
-                clear_coin_rests(self.rests, coin)
-                self.extra_oids[coin] = []
-            except RateLimited:
-                limited = True
+        # 同一轮不再次撤销刚查到的订单；旧快照不能触发重复撤单。
+        limited = limited or any(self._has_rest(c) or self.extra_oids[c]
+                                 for c in self.markets if only_coin is None or c == only_coin)
         return {"rateLimited": limited, "fetched": True}
 
     def _place(self, coin: str, plan: QuotePlan) -> dict[str, Any] | None:
         if not plan.intents:
             return None
+        reducing = all(i.reduce_only for i in plan.intents)
+        if self.unknown_write or not self.position_fresh():
+            return {"blocked": True}
+        if not reducing:
+            self.refresh_budget()
+            if not self.entry_allowed() or self.deadman_until - time.time() < DEADMAN_REMAIN_LT_S:
+                return {"blocked": True}
         specs = []
         pending: list[tuple[str, Any]] = []
         for intent in plan.intents:
@@ -639,17 +767,15 @@ class LiveQuoter:
         self._fee_banner(coin)
         payload = self.signer.signed_orders(specs)
         try:
-            resp = self._post(payload)
+            resp = self._post(payload, purpose="exit" if reducing else "entry", actions=len(specs))
         except RateLimited:
             log.warning("place 429 %s", coin)
             raise
-        if is_alo_reject(resp):
-            if plan.take:
-                log.warning("IOC flatten missed %s %s", coin, resp)
-                return {"iocFail": True, "resp": resp}
-            log.warning("ALO px rejected, will requote %s %s", coin, resp)
-            self.last_plan_key[coin] = ""
-            return {"aloReject": True, "resp": resp}
+        except Exception:
+            # 未知结果可能是已成交或已挂出；保留原 CLOID 以便撤销，不生成新单重发。
+            for idx, (side, intent) in enumerate(pending):
+                self.rests[coin][side] = RestSlot(cloid=specs[idx][4], px=intent.px, sz=intent.sz)
+            raise
         if not action_ok(resp):
             if plan.take:
                 log.warning("IOC flatten failed %s %s", coin, resp)
@@ -661,23 +787,42 @@ class LiveQuoter:
             log.warning("order not ok %s %s", coin, resp)
             return {"resp": resp}
         statuses = resp_statuses(resp)
+        if len(statuses) > len(pending):
+            self.unknown_write = True
+            self.halt_entries("unexpected extra order statuses; reconcile manually")
         now = time.time()
         accepted = 0
         for idx, (_side, intent) in enumerate(pending):
             st = statuses[idx] if idx < len(statuses) else None
             err = status_error(st)
             if err:
+                if is_weight_limit_error(err):
+                    self._trip_weight_backoff(err)
                 if is_alo_reject(err):
                     log.warning("ALO px rejected, will requote %s %s", coin, err)
                     self.last_plan_key[coin] = ""
-                    self._diag_quotes(coin, accepted, take=plan.take)
-                    return {"aloReject": True, "resp": resp}
+                    continue
                 if plan.take:
                     log.warning("IOC flatten status %s %s", coin, err)
-                    return {"iocFail": True, "resp": resp}
+                    continue
                 log.warning("order status %s %s", coin, err)
                 continue
-            oid = status_oid(st)
+            if isinstance(st, dict) and isinstance(st.get("filled"), dict):
+                # IOC 全部/部分成交均不会成为挂单；仓位由新查询确认。
+                self.positions_valid = False
+                continue
+            if not isinstance(st, dict) or not isinstance(st.get("resting"), dict):
+                self.unknown_write = True
+                self.halt_entries("missing/unknown order status; reconcile manually")
+                self.rests[coin][intent.side] = RestSlot(cloid=specs[idx][4])
+                continue
+            try:
+                oid = status_oid(st)
+            except (ValueError, TypeError):
+                oid = None
+            if oid is None:
+                self.unknown_write = True
+                self.halt_entries("resting order without valid oid; reconcile manually")
             slot = RestSlot(
                 oid=oid,
                 cloid=specs[idx][4],
@@ -690,19 +835,37 @@ class LiveQuoter:
             self.rests[coin][intent.side] = slot
             accepted += 1
         log.info(
-            "%s %s %s",
-            "take" if plan.take else "rest",
+            "order_result kind=%s coin=%s accepted_rests=%d intents=%s",
+            "take" if plan.take else "maker",
             coin,
+            accepted,
             [(i.side, i.px, i.sz, i.tif, "ro" if i.reduce_only else "") for i in plan.intents],
         )
         self._diag_quotes(coin, accepted, take=plan.take)
         return {"resp": resp}
 
     def requote(self, coin: str, top: BookTop) -> None:
-        if self._in_weight_backoff():
+        plan_started = time.time()
+        if time.time() < max(self.next_safety_poll.get(coin, 0), self.http_backoff_until):
             return
         self.refresh_positions()
+        self.refresh_budget()
+        if not self.position_fresh() or self.unknown_write:
+            self.next_safety_poll[coin] = time.time() + 5.0
+            self.cancel_coin_rests(only_coin=coin)
+            return
         plan = self.plan_for(coin, top)
+        if plan.mode == "flat" and not self.entry_allowed():
+            self.next_safety_poll[coin] = time.time() + 5.0
+            self.cancel_coin_rests(only_coin=coin)
+            return
+        if plan.mode != "flat" and self.entry_halt and not plan.take:
+            # 限额期间不消耗稀缺动作重报 ALO，先撤增仓单，15s 后才走原 IOC 阶梯。
+            self.cancel_coin_rests(only_coin=coin)
+            self.next_safety_poll[coin] = time.time() + 5.0
+            return
+        if plan.mode != "flat" and time.time() < self.next_exit_at:
+            return
         key = plan.key()
         stale = (
             plan.mode == "flat"
@@ -721,14 +884,26 @@ class LiveQuoter:
                 return
             log.info("flatten take %s age=%.1fs szi=%s", coin, plan.age_ms / 1000, plan.szi)
             try:
-                self.cancel_coin_rests(refetch=True)
+                result = self.cancel_coin_rests(refetch=True, only_coin=coin)
             except Exception as exc:  # noqa: BLE001
                 log.warning("cancel before IOC %s: %s", coin, exc)
+                return
+            if result.get("rateLimited"):
+                self.next_safety_poll[coin] = time.time() + 5.0
+                return
             if side_occupied(self.rests, coin, "B") or side_occupied(self.rests, coin, "A"):
                 log.warning("still have rests after cancel; skip IOC place %s", coin)
                 self.maybe_deadman()
                 return
             self.last_take_at[coin] = now
+            self.refresh_positions(force=True)
+            if not self.position_fresh():
+                return
+            plan = self.plan_for(coin, top)
+            if not plan.take:
+                return
+            if time.time() - plan_started > 3.0:
+                return
             try:
                 self._place(coin, plan)
             except RequestWeightLimited:
@@ -754,8 +929,8 @@ class LiveQuoter:
             extras = list(self.extra_oids.get(coin, []))
             if extras:
                 try:
-                    self._cancel_pairs(coin, extras, [])
-                    self.extra_oids[coin] = []
+                    if self._cancel_pairs(coin, extras, []):
+                        self.extra_oids[coin] = []
                 except RequestWeightLimited:
                     return
                 except Exception as extra_exc:  # noqa: BLE001
@@ -785,13 +960,28 @@ class LiveQuoter:
         else:
             log.info("plan change, cancel then place %s stage=%s tif=%s", coin, plan.stage, plan.tif)
         try:
-            self.cancel_coin_rests(refetch=True)
+            result = self.cancel_coin_rests(refetch=True, only_coin=coin)
         except Exception as exc:  # noqa: BLE001
             if is_alo_reject(exc):
                 log.warning("ALO reject during cancel/replace %s: %s", coin, exc)
                 self.last_plan_key[coin] = ""
                 return
             log.warning("cancel before replace %s: %s", coin, exc)
+            return
+        if result.get("rateLimited"):
+            self.next_safety_poll[coin] = time.time() + 5.0
+            return
+        self.refresh_positions(force=True)
+        if not self.position_fresh():
+            return
+        fresh_plan = self.plan_for(coin, top)
+        if fresh_plan.mode != plan.mode or fresh_plan.szi != plan.szi:
+            self.last_plan_key[coin] = ""
+            return
+        if plan.mode == "flat":
+            self.maybe_deadman()
+        if time.time() - plan_started > 3.0:
+            return
         try:
             placed = self._place(coin, plan)
         except RequestWeightLimited:
@@ -811,7 +1001,7 @@ class LiveQuoter:
             log.warning("place failed %s: %s", coin, exc)
             self._mark_replaced(coin)
             return
-        if placed and placed.get("aloReject"):
+        if placed and (placed.get("aloReject") or placed.get("blocked")):
             self._mark_replaced(coin)
             return
         self.last_plan_key[coin] = key
@@ -832,8 +1022,12 @@ class LiveQuoter:
         self.flush_markouts()
         for coin in self.markets:
             try:
+                if time.time() < self.next_safety_poll.get(coin, 0):
+                    continue
                 top = self.book_for(coin, feed)
                 if top is None or top.bid is None or top.ask is None:
+                    self.next_safety_poll[coin] = time.time() + 5.0
+                    self.cancel_coin_rests(only_coin=coin)
                     continue
                 self.requote(coin, top)
             except Exception as exc:  # noqa: BLE001
@@ -842,9 +1036,16 @@ class LiveQuoter:
                     self.last_plan_key[coin] = ""
                     continue
                 log.warning("live step %s: %s", coin, exc)
+                self.next_safety_poll[coin] = time.time() + 5.0
+                self.halt_entries("execution loop could not establish safe state; manual review required")
+                try:
+                    self.cancel_coin_rests(only_coin=coin)
+                except Exception:
+                    log.error("SAFETY cleanup unconfirmed for %s; check account manually", coin)
         self.maybe_deadman()
 
     def shutdown_cancels(self) -> None:
+        self.shutting_down = True
         limited = False
         try:
             result = self.cancel_coin_rests(refetch=True)
@@ -852,25 +1053,14 @@ class LiveQuoter:
         except Exception as exc:  # noqa: BLE001
             log.warning("shutdown cancel: %s", exc)
             limited = True
-        leftover = [
-            (self.markets[coin].asset_id, slot.cloid)
-            for coin, sides in self.rests.items()
-            for slot in sides.values()
-            if slot.cloid and is_bot_cloid(slot.cloid)
-        ]
-        if leftover:
-            try:
-                resp = self._post(self.signer.signed_cancel_cloids(leftover))
-                log.info("shutdown cloid cancel %s", resp)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("shutdown cloid cancel: %s", exc)
         if limited:
-            try:
-                self.schedule_deadman(DEADMAN_FALLBACK_MS)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("shutdown dead-man fallback: %s", exc)
+            log.error("SHUTDOWN orders unconfirmed; existing dead-man retained, check account manually")
         else:
             self.clear_deadman()
+        self.refresh_positions(force=True)
+        if not self.position_fresh() or any(self.pos.values()) or limited or self.unknown_write:
+            raise LiveGuardError("SHUTDOWN NOT CLEAN: position/order state requires manual review; cancel is not flatten")
+        log.info("SHUTDOWN confirmed flat with no managed orders; no automatic flatten was attempted")
 
 
 def _log_agent(client: InfoClient, signer: LiveSigner) -> None:
@@ -922,15 +1112,16 @@ def run_live(settings: Settings, *, seconds: float | None = None) -> int:
         log.info(
             "dead-man is account-wide: scheduleCancel +20s; refresh only when "
             "remaining < %ss (not every few seconds). Failed weight renew: log, no tight-loop. "
-            "Official min 5s; 429 fallback +6s. Clear (no time) on clean stop.",
+            "Only acknowledged deadlines count. No immediate 429 fallback. "
+            "Clear (no time) attempted only after confirmed cancellations; cancel is not flatten.",
             int(DEADMAN_REMAIN_LT_S),
         )
         log.info(
             "write throttle: MIN_REPLACE_S=%ss per coin while a rest is live "
             "(book ticks do not cancel+replace). Flatten ≥15s IOC take still fires. "
-            "request-weight error backs off signed writes for %ss (log once). "
-            "ops: ANTH-only until weight recovers and NY RTH for SNDK "
-            "(COINS default still lists both).",
+            "request-weight error latches entries OFF; maintenance backoff %ss. "
+            "Cancels and reduce-only exits are paced separately; no quota purchase. "
+            "No automatic session filter; account must be exclusive to this bot.",
             settings.min_replace_s,
             weight_backoff_s(settings.min_replace_s),
         )
@@ -941,14 +1132,9 @@ def run_live(settings: Settings, *, seconds: float | None = None) -> int:
             "AH markout stays in its own bucket."
         )
         _log_agent(client, signer)
-        user_state = client.clearinghouse_state(signer.account, ALLOWED_DEX, optional=True)
-        if user_state:
-            log.info("isolated user state withdrawable=%s", user_state.get("withdrawable"))
         quoter = LiveQuoter(settings, markets, client, signer)
-        if user_state:
-            parsed = positions_from_state(user_state, tuple(markets), markets)
-            if parsed is not None:
-                quoter.pos = parsed
+        quoter.preflight()
+        quoter.managed_started = True
         quoter.bootstrap_isolated()
 
         stop = {"flag": False}
@@ -983,7 +1169,8 @@ def run_live(settings: Settings, *, seconds: float | None = None) -> int:
     finally:
         if feed is not None:
             feed.stop()
-        if quoter is not None:
+        shutdown_error = None
+        if quoter is not None and quoter.managed_started:
             try:
                 quoter.flush_markouts()
             except Exception as exc:  # noqa: BLE001
@@ -992,4 +1179,7 @@ def run_live(settings: Settings, *, seconds: float | None = None) -> int:
                 quoter.shutdown_cancels()
             except Exception as exc:  # noqa: BLE001
                 log.warning("shutdown: %s", exc)
+                shutdown_error = exc
         client.close()
+        if shutdown_error is not None:
+            raise LiveGuardError(str(shutdown_error)) from shutdown_error
