@@ -1,5 +1,8 @@
 # entropy-bot
 
+本 Fork 的执行安全修复与测试边界见 [SAFETY_REVIEW.md](SAFETY_REVIEW.md)。
+尚未完成 Ubuntu/交易所实盘验证，不应把测试通过理解为可以无人值守运行。
+
 **This Python package is the real bot.** It talks only to official Hyperliquid HTTP + WebSocket. The Chrome Tampermonkey userscript (`entropy-desk.user.js`) is optional / legacy — do not depend on it for live MM.
 
 EntropyIO HIP-3 perps on Hyperliquid: **`io:ANTH`** and **`io:SNDK`** only. DEX name is **`io`** (`fullName` = EntropyIO). `xyz:SNDK`, `vntl:ANTHROPIC` are other venues. `io:OAI` / `io:IONQ` are delisted. All refused.
@@ -40,9 +43,9 @@ ALO / Bad Alo Px / post-only reject: log and requote; the loop does not stop. St
 
 ### Request weight / write throttle
 
-Hyperliquid address-level cumulative request weight (`nRequestsUsed` vs `nRequestsCap`) scales with lifetime volume. **Waiting does not restore the cap.** After `Too many cumulative requests` / request-weight errors the bot logs **once** and backs off **all signed writes** for `max(MIN_REPLACE_S, 30s)`. It does not retry every book tick, does not buy `reserveRequestWeight`, and does not place taker-unlock spam.
+Startup queries positions, open orders and `userRateLimit` before signed writes. Unknown/nonempty state or insufficient budget refuses startup. During execution, low budget or a cumulative rejection latches entries OFF until manual review and restart. Waiting alone never restores the cap. Cancellations and reduce-only exits have separate paced paths; ordinary exit retries are at least 3s apart and limited exits at least 11s apart. No quota purchases or taker-unlock trading.
 
-Current ops: run **ANTH-only** until weight recovers and NY RTH for SNDK. The default `COINS` example still lists `io:ANTH,io:SNDK`.
+Changing markets does not reset account limits. The default `COINS` remains `io:ANTH,io:SNDK`. Session labels are diagnostics, not an enforced trading-hours filter.
 
 WS `l2Book` for both coins. REST book only if WS is stale >15s. Inventory from `clearinghouseState` with `dex:"io"`. Open-order queries always send `dex:"io"`. A null/429 response does **not** wipe the local rest cache.
 
@@ -63,11 +66,11 @@ Fills come from the official `userFills` WS on the same connection (snapshot ign
 
 ### Dead-man (account-wide)
 
-While `live` is running the bot sends `scheduleCancel` at **now+20s** and refreshes **only when remaining time is under 8s** (not every few seconds). Official minimum is 5s. On 429 it falls back to **+6s** (clamped ≥5s). A dead-man failure caused by request weight is logged; it does not tight-loop.
+When entry/active-rest conditions permit, `scheduleCancel` is armed at **now+20s**, refreshed with less than 8s remaining. Only acknowledged deadlines count. A 429 does not trigger an immediate second request. New entries require at least 8s of acknowledged coverage.
 
 **This is account-wide.** When the timer fires, Hyperliquid cancels **all** open orders on the master account — not just `io:ANTH` / `io:SNDK`.
 
-On a clean stop the bot sends `scheduleCancel` **without** `time` (clears the timer) after cancelling its rests. If info is rate-limited it leaves a +6s cancel instead of assuming the book is empty.
+On stop, cancel managed orders, attempt to clear the timer only after cancellation reconciliation, and query positions. Unknown state or residual position produces a nonzero exit. No automatic shutdown flatten is enabled. When cancellation cannot be confirmed, retain any previously acknowledged timer; do not claim a new timer exists.
 
 ### Agent / master signing
 
@@ -141,7 +144,7 @@ tmux new -s entropy
 python -m entropy_bot live
 # detach: Ctrl-b d
 
-# or systemd — Restart=on-failure; the dead-man (+20s, account-wide) covers a hard kill
+# Do not enable unattended service restart during validation. Dead-man cancels orders, NOT positions.
 ```
 
 If the process dies without a clean stop, `scheduleCancel` fires and cancels **every** resting order on that master.
@@ -153,7 +156,7 @@ If the process dies without a clean stop, `scheduleCancel` fires and cancels **e
 | `LIVE` | `0` | Live only if `1` **and** a private key is set |
 | `HYPERLIQUID_PRIVATE_KEY` | unset | Agent or master key. Required for `live` / `cancel`. Never commit |
 | `HYPERLIQUID_ACCOUNT` | derived from key | Master address. Set this when the key is an agent |
-| `COINS` | `io:ANTH,io:SNDK` | Case-sensitive; foreign venues rejected. Current ops: ANTH-only until request weight recovers and NY RTH for SNDK |
+| `COINS` | `io:ANTH,io:SNDK` | Case-sensitive; foreign venues rejected. Changing markets does not reset account limits |
 | `MIN_REPLACE_S` | `12` | Per-coin seconds between cancel+replace while a rest is live. Flatten ≥15s IOC take is not gated |
 | `QUOTE_NOTIONAL_USD` | `50` | Notional per side (live and paper), ≥ $10 |
 | `QUOTE_OFFSET_TICKS` | `2` | Legacy. Live ignores it |
@@ -197,7 +200,7 @@ DEX 名是 **`io`**。不要用 `xyz` 或 `vntl`。
 
 每币最多 1 买 + 1 卖。空仓双边 ALO：价差 ≤2 tick 贴买卖一；价差 >2 tick 往中间贴（例 1985.00/1986.90/tick 0.1 → 买 1985.8 卖 1986.1）。有仓只减仓：`<6s` 远档 ALO，`6–15s` 中间 ALO，`≥15s` 撤后 IOC 吃单。空仓同价挂 45s 无成交则重挂。ALO 被拒不停止。Builder 是 Entropy、费率 0。挂单还在时，盘口跳动不会立刻撤换；每币至少隔 `MIN_REPLACE_S`（默认 12 秒）才 cancel+replace。≥15s 的 IOC 吃单仍按点触发，不受这 12 秒卡住。
 
-请求权重（`Too many cumulative requests`）等不等都不会把额度补回来。命中后只打一次日志，签名写操作退避 `max(MIN_REPLACE_S, 30s)`，不会每个 book tick 重试，也不买 `reserveRequestWeight`、不加 taker-unlock。当前运维：权重恢复且 SNDK 进入纽约 RTH 之前只跑 **ANTH**；示例 `COINS` 仍列出两个币。
+累计请求限额不会因等待或切换币种恢复。启动前查询额度、仓位和挂单；未知状态、非空账户或额度不足时拒绝启动。运行中命中累计限额会锁定禁止开仓，撤单与 reduce-only 退出单走独立节流路径。普通退出重试间隔至少 3 秒，限额后的退出重试至少 11 秒。不会购买额度或为解锁额度额外交易。价格/仓位算法保持原样，异常调度不保证按 15 秒成交。REST 成交补漏改为每 30 秒，WS 逐笔诊断保持。
 
 Tick 从盘口买卖价增量推断，不用 `tick_size(mid)`。
 
@@ -209,7 +212,7 @@ Tick 从盘口买卖价增量推断，不用 `tick_size(mid)`。
 
 ### Dead-man（账户级）
 
-运行中把 `scheduleCancel` 设到 **现在+20s**，只在剩余时间 **< 8s** 时续期（不要隔几秒就刷）。官方最短 5s；429 则 +6s。权重耗尽导致的续期失败只记日志，不 tight-loop。到点后会撤销该主账户上的**全部**挂单，不限于 ANTH/SNDK。干净退出时发送不带 `time` 的 `scheduleCancel` 以清除定时。
+Dead-man 是账户级撤单定时器，不会平仓。只有交易所确认后才记录有效期限；开仓要求至少还有 8 秒已确认覆盖。429 后不立即重试，不把本地退避时间伪装成交易所保护期限。停止时撤单、核对仓位；有遗留仓位或状态未知则报告错误并非零退出。默认不自动平仓，不适合与其他机器人共用账户。
 
 ### 命令
 

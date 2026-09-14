@@ -84,6 +84,9 @@ class FakeClient:
         self.posts: list[dict[str, Any]] = []
         self.exchange_error = exchange_error
         self._oid = 3_000_000_000
+        self.state = {"assetPositions": []}
+        self.rate = {"nRequestsUsed": 10, "nRequestsCap": 10000, "nRequestsSurplus": 0}
+        self.opens = []
 
     def post_exchange(self, payload: dict[str, Any]) -> Any:
         if self.exchange_error is not None:
@@ -101,17 +104,21 @@ class FakeClient:
                 specs = action.get("orders")
                 n = len(specs) if isinstance(specs, list) else 2
             statuses = []
-            for _ in range(max(n, 1)):
+            for spec in action["orders"]:
                 self._oid += 1
-                statuses.append({"resting": {"oid": self._oid}})
+                statuses.append({"filled" if spec[-1] == "Ioc" else "resting": {"oid": self._oid}})
             return {"status": "ok", "response": {"type": "order", "data": {"statuses": statuses}}}
-        return {"status": "ok", "response": {"type": kind or "ok"}}
+        return {"status": "ok", "response": {"type": kind or "ok", "data": {
+            "statuses": ["success"] * len(action.get("cancels", []))}}}
 
-    def clearinghouse_state(self, *args: object, **kwargs: object) -> None:
-        return None
+    def clearinghouse_state(self, *args: object, **kwargs: object):
+        return self.state
+
+    def user_rate_limit(self, *args: object, **kwargs: object):
+        return self.rate
 
     def open_orders(self, *args: object, **kwargs: object) -> list:
-        return []
+        return self.opens
 
     def l2_book(self, coin: str) -> dict[str, Any]:
         return _book_data("1985.0", "1985.1")
@@ -209,7 +216,8 @@ def test_weight_limit_error_triggers_backoff(markets, monkeypatch):
     clock.advance(26.0)  # 31s total >= 30s floor
     assert not quoter._in_weight_backoff()
     quoter.requote("io:ANTH", _top("1985.4", "1985.5"))
-    assert len(_order_posts(client)) >= 1
+    assert not _order_posts(client), "时间经过不能解除禁止开仓锁"
+    assert quoter.entry_halt
 
 
 def test_flatten_take_fires_even_if_last_replace_recent(markets, monkeypatch):
@@ -223,6 +231,7 @@ def test_flatten_take_fires_even_if_last_replace_recent(markets, monkeypatch):
     quoter.rests["io:ANTH"]["A"] = RestSlot(oid=3_000_000_010, px=1985.1, sz=0.02, placed_at=clock.t)
     quoter.last_replace["io:ANTH"] = clock.t
     quoter.pos["io:ANTH"] = 0.02
+    client.state = {"assetPositions": [{"position": {"coin": "io:ANTH", "szi": "0.02"}}]}
     quoter.pos_since["io:ANTH"] = clock.t - 16.0
 
     clock.advance(1.0)
@@ -252,6 +261,7 @@ def test_deadman_refreshes_only_when_remaining_under_8s(markets, monkeypatch):
     quoter = _quoter(markets, clock=clock, client=client)
     quoter.deadman_until = clock.t + 20.0
     quoter.last_deadman = clock.t
+    quoter.rests["io:ANTH"]["B"] = RestSlot(oid=123)
 
     quoter.maybe_deadman()
     assert not any((p.get("action") or {}).get("type") == "scheduleCancel" for p in client.posts)
