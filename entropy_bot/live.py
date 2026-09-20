@@ -52,6 +52,7 @@ from entropy_bot.safety import (BUDGET_POLL_S, HTTP_BACKOFF_S, LIMITED_EXIT_GAP_
                                 RequestBudget, cancel_confirmed)
 from entropy_bot.rest import InfoClient
 from entropy_bot.status import load_io_markets
+from entropy_bot.session import SupervisedSession
 from entropy_bot.ws import BookFeed
 
 log = logging.getLogger("entropy_bot.live")
@@ -313,6 +314,7 @@ class LiveQuoter:
     _fill_generation: int = 0
     _position_generation: int = -1
     next_safety_poll: dict[str, float] = field(default_factory=dict)
+    session: SupervisedSession | None = None
 
     def __post_init__(self) -> None:
         if not self.notional:
@@ -356,6 +358,30 @@ class LiveQuoter:
             self.entry_halt = reason
             log.error("SAFETY entry_halt=%s", reason)
 
+    def raise_if_halted_and_flat(self) -> None:
+        """严格模式安全拒绝后，空仓时进入最终清理；持仓管理仍继续。"""
+        if not self.entry_halt or self.unknown_write:
+            return
+        if not self.position_fresh() or any(self.pos.values()):
+            return
+        if any(self._has_rest(c) or self.extra_oids.get(c) for c in self.markets):
+            return
+        raise LiveGuardError(f"SAFETY STOP: {self.entry_halt}; final account checks will follow")
+
+    def session_account_clear(self) -> bool:
+        """停机期间先查挂单，再查仓位，不能把撤单确认等同于平仓。"""
+        if self.unknown_write:
+            return False
+        try:
+            opens = self.client.open_orders(self.signer.account, ALLOWED_DEX, optional=True)
+            if opens != []:
+                return False
+            self.refresh_positions(force=True)
+            return self.position_fresh() and not any(self.pos.values())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("SESSION final state query failed: %s", exc)
+            return False
+
     def refresh_budget(self, *, force: bool = False) -> None:
         now = time.time()
         if not force and now - self.last_budget_poll < BUDGET_POLL_S:
@@ -377,6 +403,7 @@ class LiveQuoter:
 
     def entry_allowed(self) -> bool:
         return (not self.entry_halt and not self.unknown_write and not self.shutting_down
+                and (self.session is None or self.session.can_enter())
                 and self.position_fresh()
                 and self.budget.can_enter(time.time(), len(self.markets)))
 
@@ -571,6 +598,8 @@ class LiveQuoter:
             raise RateLimited("local HTTP backoff")
         if purpose == "entry" and not self.entry_allowed():
             raise RequestWeightLimited("entry safety gate closed")
+        if purpose == "exit" and self.session is not None and not self.session.can_exit():
+            raise RateLimited("session cleanup deadline passed; no new exit orders")
         if purpose == "exit" and (self.unknown_write or now < self.next_exit_at):
             raise RateLimited("exit awaits reconciliation or paced retry")
         if purpose == "cancel" and now < self.next_cancel_at:
@@ -610,6 +639,8 @@ class LiveQuoter:
 
     def schedule_deadman(self, ahead_ms: int = DEADMAN_AHEAD_MS) -> None:
         """Account-wide: cancels ALL open orders on the master when it fires."""
+        if self.session is not None:
+            return  # 显式人工值守模式：不申请、不伪造交易所自动撤单保护。
         if time.time() < self.next_deadman_at:
             return
         self.next_deadman_at = time.time() + HTTP_BACKOFF_S
@@ -617,7 +648,10 @@ class LiveQuoter:
         try:
             resp = self._post(self.signer.signed_schedule_cancel(deadline))
             if not isinstance(resp, dict) or resp.get("status") != "ok":
-                self.halt_entries("dead-man rejected; no confirmed protection")
+                raw_error = resp.get("response") if isinstance(resp, dict) else None
+                detail = (" ".join(raw_error.split())[:500] if isinstance(raw_error, str)
+                          else "missing or unexpected exchange response")
+                self.halt_entries(f"dead-man rejected: {detail}; no confirmed protection")
                 return
             now = time.time()
             self.last_deadman = now
@@ -629,6 +663,8 @@ class LiveQuoter:
             log.warning("dead-man rate limited; no immediate fallback retry")
 
     def maybe_deadman(self) -> None:
+        if self.session is not None:
+            return
         now = time.time()
         if self.entry_halt or self.shutting_down or self._in_weight_backoff():
             return
@@ -650,6 +686,8 @@ class LiveQuoter:
             self.next_deadman_at = now + max(self.settings.min_replace_s, HTTP_BACKOFF_S)
 
     def clear_deadman(self) -> None:
+        if self.session is not None or self.deadman_until <= 0:
+            return
         try:
             resp = self._post(self.signer.signed_schedule_cancel(None))
             if not isinstance(resp, dict) or resp.get("status") != "ok":
@@ -741,7 +779,9 @@ class LiveQuoter:
             return {"blocked": True}
         if not reducing:
             self.refresh_budget()
-            if not self.entry_allowed() or self.deadman_until - time.time() < DEADMAN_REMAIN_LT_S:
+            if not self.entry_allowed() or (
+                self.session is None and self.deadman_until - time.time() < DEADMAN_REMAIN_LT_S
+            ):
                 return {"blocked": True}
         specs = []
         pending: list[tuple[str, Any]] = []
@@ -1054,13 +1094,14 @@ class LiveQuoter:
             log.warning("shutdown cancel: %s", exc)
             limited = True
         if limited:
-            log.error("SHUTDOWN orders unconfirmed; existing dead-man retained, check account manually")
+            log.error("SHUTDOWN orders unconfirmed; confirmed dead-man deadline=%s; "
+                      "check account manually (0 means no confirmed protection)", self.deadman_until)
         else:
             self.clear_deadman()
         self.refresh_positions(force=True)
         if not self.position_fresh() or any(self.pos.values()) or limited or self.unknown_write:
             raise LiveGuardError("SHUTDOWN NOT CLEAN: position/order state requires manual review; cancel is not flatten")
-        log.info("SHUTDOWN confirmed flat with no managed orders; no automatic flatten was attempted")
+        log.info("SHUTDOWN confirmed flat with no managed orders; final verification complete")
 
 
 def _log_agent(client: InfoClient, signer: LiveSigner) -> None:
@@ -1086,12 +1127,66 @@ def _log_agent(client: InfoClient, signer: LiveSigner) -> None:
         )
 
 
-def run_live(settings: Settings, *, seconds: float | None = None) -> int:
+def _run_supervised(quoter: LiveQuoter, feed: BookFeed, stop: dict[str, Any]) -> int:
+    """到时/首个停止信号后只减仓；等待有界，不循环重启或自动购买额度。"""
+    session = quoter.session
+    assert session is not None
+    cancellation_confirmed = False
+    next_cancel = next_check = next_report = 0.0
+    reported_reason = ""
+    while True:
+        now = time.monotonic()
+        if stop["count"] > 1:
+            raise LiveGuardError("STOP second signal: cleanup interrupted; check account manually")
+        if stop["flag"]:
+            session.request_stop(f"signal:{signal.Signals(stop['signal']).name}")
+        if quoter.entry_halt:
+            session.request_stop(f"safety:{quoter.entry_halt}")
+        session.tick()
+        if session.stop_reason:
+            if not reported_reason:
+                reported_reason = session.stop_reason
+                log.warning("SESSION DRAIN reason=%s; entries OFF; reduce-only until flat or deadline",
+                            reported_reason)
+            if not session.can_exit():
+                raise LiveGuardError("SESSION cleanup timed out; positions/orders require manual check")
+            if not cancellation_confirmed:
+                if now >= next_cancel:
+                    next_cancel = now + 5.0
+                    try:
+                        result = quoter.cancel_coin_rests(refetch=True)
+                        cancellation_confirmed = not result.get("rateLimited", True)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("SESSION initial cancellation unconfirmed: %s", exc)
+                if not cancellation_confirmed:
+                    time.sleep(LOOP_S)
+                    continue
+            if now >= next_check:
+                next_check = now + 5.0
+                if quoter.session_account_clear():
+                    if quoter.entry_halt:
+                        raise LiveGuardError(f"SAFETY STOP: {quoter.entry_halt}; account reconciled flat")
+                    log.info("SESSION DONE reason=%s; exchange reports flat and no orders", reported_reason)
+                    return 0
+        quoter.step(feed)  # 原有报价/6s-15s退出阶梯；session.can_enter 阻止重新开仓。
+        if now >= next_report:
+            next_report = now + 60.0
+            log.info("SESSION heartbeat mode=supervised-no-deadman remaining_s=%.0f draining=%s budget=%.0f",
+                     max(0, session.end_at - now), bool(session.stop_reason), quoter.budget.available)
+        time.sleep(LOOP_S)
+
+
+def run_live(settings: Settings, *, seconds: float | None = None,
+             supervised_no_deadman: bool = False) -> int:
+    session = SupervisedSession(seconds) if supervised_no_deadman else None
+    if seconds is not None and (not math.isfinite(seconds) or seconds <= 0):
+        raise LiveGuardError("--seconds must be finite and positive")
     require_live(settings)
     signer = LiveSigner(settings.private_key or "", settings.account)
     client = InfoClient(settings.api_url)
     feed: BookFeed | None = None
     quoter: LiveQuoter | None = None
+    previous_handlers: dict[int, Any] = {}
     try:
         _meta, markets, _ctxs = load_io_markets(client, settings.coins)
         dex = perp_dex_info(client.perp_dexs(), ALLOWED_DEX)
@@ -1109,13 +1204,19 @@ def run_live(settings: Settings, *, seconds: float | None = None) -> int:
         )
         log.info("%s", describe_fee_model(settings))
         log.info("%s", ALO_TIF_NOTE)
-        log.info(
-            "dead-man is account-wide: scheduleCancel +20s; refresh only when "
-            "remaining < %ss (not every few seconds). Failed weight renew: log, no tight-loop. "
-            "Only acknowledged deadlines count. No immediate 429 fallback. "
-            "Clear (no time) attempted only after confirmed cancellations; cancel is not flatten.",
-            int(DEADMAN_REMAIN_LT_S),
-        )
+        if session is not None:
+            log.warning(
+                "SUPERVISED NO DEAD-MAN: exchange auto-cancel is DISABLED; server/network failure "
+                "can leave live orders and positions. Manual supervision required. seconds=%s", seconds,
+            )
+        else:
+            log.info(
+                "dead-man is account-wide: scheduleCancel +20s; refresh only when "
+                "remaining < %ss (not every few seconds). Failed weight renew: log, no tight-loop. "
+                "Only acknowledged deadlines count. No immediate 429 fallback. "
+                "Clear (no time) attempted only after confirmed cancellations; cancel is not flatten.",
+                int(DEADMAN_REMAIN_LT_S),
+            )
         log.info(
             "write throttle: MIN_REPLACE_S=%ss per coin while a rest is live "
             "(book ticks do not cancel+replace). Flatten ≥15s IOC take still fires. "
@@ -1133,17 +1234,24 @@ def run_live(settings: Settings, *, seconds: float | None = None) -> int:
         )
         _log_agent(client, signer)
         quoter = LiveQuoter(settings, markets, client, signer)
+        quoter.session = session
         quoter.preflight()
         quoter.managed_started = True
-        quoter.bootstrap_isolated()
 
-        stop = {"flag": False}
+        stop = {"flag": False, "signal": None, "count": 0}
 
-        def _handle(_signum: int, _frame: object) -> None:
+        def _handle(signum: int, _frame: object) -> None:
+            stop["signal"] = signum
+            stop["count"] += 1
             stop["flag"] = True
+            if session is not None:
+                session.request_stop(f"signal:{signal.Signals(signum).name}")
 
-        signal.signal(signal.SIGINT, _handle)
-        signal.signal(signal.SIGTERM, _handle)
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, _handle)
+
+        quoter.bootstrap_isolated()
 
         quoter.poll_user_fills(force=True)
         feed = BookFeed(
@@ -1159,12 +1267,21 @@ def run_live(settings: Settings, *, seconds: float | None = None) -> int:
             log.error("websocket did not become ready")
             feed.stop()
             return 1
+        if session is not None:
+            return _run_supervised(quoter, feed, stop)
         deadline = time.time() + seconds if seconds else None
         while not stop["flag"]:
             if deadline and time.time() >= deadline:
+                log.info("STOP reason=duration seconds=%s", seconds)
                 break
             quoter.step(feed)
+            if not stop["flag"]:
+                quoter.raise_if_halted_and_flat()
             time.sleep(LOOP_S)
+        if stop["signal"] is not None:
+            log.info("STOP reason=signal signal=%s", signal.Signals(stop["signal"]).name)
+        if quoter.entry_halt:
+            raise LiveGuardError(f"SAFETY STOP: {quoter.entry_halt}")
         return 0
     finally:
         if feed is not None:
@@ -1181,5 +1298,7 @@ def run_live(settings: Settings, *, seconds: float | None = None) -> int:
                 log.warning("shutdown: %s", exc)
                 shutdown_error = exc
         client.close()
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
         if shutdown_error is not None:
             raise LiveGuardError(str(shutdown_error)) from shutdown_error

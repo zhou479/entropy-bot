@@ -31,6 +31,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Official HTTP+WS live MM (ALO + flatten ladder). Requires LIVE=1 and a key.",
     )
     live.add_argument("--seconds", type=float, default=None, help="Stop after N seconds")
+    live.add_argument(
+        "--supervised-no-deadman", action="store_true",
+        help="Explicitly run without exchange-side auto-cancel; requires --seconds <=10800. "
+             "Stops entries before the deadline, then attempts bounded reduce-only cleanup.",
+    )
     sub.add_parser("cancel", help="Cancel resting bot cloIDs on ANTH/SNDK.")
     return parser
 
@@ -52,7 +57,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "live":
             from entropy_bot.live import run_live
 
-            return run_live(settings, seconds=args.seconds)
+            return run_live(
+                settings, seconds=args.seconds,
+                supervised_no_deadman=args.supervised_no_deadman,
+            )
         if args.command == "cancel":
             from entropy_bot.cancel import run_cancel
 

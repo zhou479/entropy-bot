@@ -1,0 +1,9 @@
+# 本地回归测试使用的直接依赖版本；不是完整的传递依赖锁文件。
+hyperliquid-python-sdk==0.24.0
+eth-account==0.13.7
+eth-utils==5.3.1
+msgpack==1.2.2
+requests==2.34.2
+websocket-client==1.9.2
+python-dotenv==1.2.3
+pytest==9.1.1

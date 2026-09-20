@@ -1,7 +1,8 @@
 # entropy-bot
 
-本 Fork 的执行安全修复与测试边界见 [SAFETY_REVIEW.md](SAFETY_REVIEW.md)。
-尚未完成 Ubuntu/交易所实盘验证，不应把测试通过理解为可以无人值守运行。
+每天人工运行 2～3 小时的部署与修复说明见 [DEPLOY_SUPERVISED.md](DEPLOY_SUPERVISED.md)。
+新增显式 `live --supervised-no-deadman --seconds 7200` 模式，不申请不可用的自动撤单保护；到时关闭新开仓并尝试有界减仓。服务器故障仍可能留仓，不能无人值守。推荐使用文档中的启动脚本（每次确认、日志、同机互斥）。
+原执行安全修复的历史审查见 [SAFETY_REVIEW.md](SAFETY_REVIEW.md)；离线测试通过不等于实盘或收益验证。
 
 **This Python package is the real bot.** It talks only to official Hyperliquid HTTP + WebSocket. The Chrome Tampermonkey userscript (`entropy-desk.user.js`) is optional / legacy — do not depend on it for live MM.
 
@@ -66,11 +67,11 @@ Fills come from the official `userFills` WS on the same connection (snapshot ign
 
 ### Dead-man (account-wide)
 
-When entry/active-rest conditions permit, `scheduleCancel` is armed at **now+20s**, refreshed with less than 8s remaining. Only acknowledged deadlines count. A 429 does not trigger an immediate second request. New entries require at least 8s of acknowledged coverage.
+In default strict mode, when entry/active-rest conditions permit, `scheduleCancel` is armed at **now+20s**, refreshed with less than 8s remaining. Only acknowledged deadlines count. A 429 does not trigger an immediate second request. New entries require at least 8s of acknowledged coverage. The explicit supervised mode described above has no exchange-side auto-cancel; it requires a finite duration of at most 3 hours and never silently falls back from strict mode.
 
 **This is account-wide.** When the timer fires, Hyperliquid cancels **all** open orders on the master account — not just `io:ANTH` / `io:SNDK`.
 
-On stop, cancel managed orders, attempt to clear the timer only after cancellation reconciliation, and query positions. Unknown state or residual position produces a nonzero exit. No automatic shutdown flatten is enabled. When cancellation cannot be confirmed, retain any previously acknowledged timer; do not claim a new timer exists.
+On strict-mode stop, cancel managed orders, attempt to clear a previously confirmed timer only after cancellation reconciliation, and query positions. Unknown state or residual position produces a nonzero exit. Strict mode does not automatically flatten on shutdown. Supervised mode first drains positions through the existing reduce-only ladder within a bounded window, then performs the same final checks. When cancellation cannot be confirmed, retain any previously acknowledged timer; do not claim a new timer exists.
 
 ### Agent / master signing
 
@@ -147,7 +148,7 @@ python -m entropy_bot live
 # Do not enable unattended service restart during validation. Dead-man cancels orders, NOT positions.
 ```
 
-If the process dies without a clean stop, `scheduleCancel` fires and cancels **every** resting order on that master.
+Only an accepted and still-active `scheduleCancel` can cancel resting orders after a process failure. It does not close positions. Supervised mode does not set this timer.
 
 ### Config (env / `.env`)
 
@@ -212,7 +213,7 @@ Tick 从盘口买卖价增量推断，不用 `tick_size(mid)`。
 
 ### Dead-man（账户级）
 
-Dead-man 是账户级撤单定时器，不会平仓。只有交易所确认后才记录有效期限；开仓要求至少还有 8 秒已确认覆盖。429 后不立即重试，不把本地退避时间伪装成交易所保护期限。停止时撤单、核对仓位；有遗留仓位或状态未知则报告错误并非零退出。默认不自动平仓，不适合与其他机器人共用账户。
+Dead-man 是账户级撤单定时器，不会平仓。默认严格模式只有交易所确认后才记录有效期限；开仓要求至少还有 8 秒已确认覆盖。429 后不立即重试，不把本地退避时间伪装成交易所保护期限。严格模式停止时撤单、核对仓位，不自动平仓；有遗留仓位或状态未知则报告错误并非零退出。新增人工值守模式不设置这个定时器，到时先关闭新开仓并尝试有界减仓，详见上方部署文档。账户不适合与其他机器人共用。
 
 ### 命令
 
@@ -223,7 +224,7 @@ python -m entropy_bot live     # 实盘；缺 LIVE=1 或私钥会直接拒绝
 python -m entropy_bot cancel   # 撤销本机器人的 cloid
 ```
 
-VPS：`.env` 里设 `LIVE=1`、agent 私钥、主地址，用 tmux 或 systemd 跑 `python -m entropy_bot live`。进程被硬杀时靠账户级 dead-man 撤单。
+VPS 人工限时运行请按 [DEPLOY_SUPERVISED.md](DEPLOY_SUPERVISED.md) 配置 agent、tmux 和启动脚本。不要配置自动重启。只有交易所已经接受且尚有效的 dead-man 才能在进程失联后撤单，人工值守模式没有该保护。
 
 ### 安全
 
