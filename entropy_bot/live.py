@@ -441,7 +441,7 @@ class LiveQuoter:
         feed = self._feed
         if feed is not None:
             latest = feed.latest(coin)
-            if latest is not None:
+            if latest is not None and latest[0] >= ts:
                 ts, data = latest
         if data is None:
             return None
@@ -553,7 +553,7 @@ class LiveQuoter:
                 ts, data = self.books[coin]
         if feed is not None:
             latest = feed.latest(coin)
-            if latest is not None:
+            if latest is not None and latest[0] >= ts:
                 ts, data = latest
         stale = data is None or (now - ts) > WS_STALE_S
         if stale:
@@ -783,6 +783,27 @@ class LiveQuoter:
                 self.session is None and self.deadman_until - time.time() < DEADMAN_REMAIN_LT_S
             ):
                 return {"blocked": True}
+        # 撤单、仓位查询、额度查询及 dead-man 续期均可能阻塞。
+        # 最后一个查询完成后重新取盘口及计算阶段，不能发送旧计划。
+        # 正常行情直接读已有 WS 缓存；断流仍走原来的 REST 兜底及校验。
+        top = self.book_for(coin, self._feed)
+        if top is None or not self.position_fresh() or self.unknown_write:
+            log.warning("pre-send blocked %s: book/position unavailable", coin)
+            return {"blocked": True}
+        fresh_plan = self.plan_for(coin, top)
+        if (fresh_plan.mode != plan.mode or fresh_plan.szi != plan.szi
+                or fresh_plan.take != plan.take):
+            # ALO 跨入 IOC 时交回下一轮的 IOC 分支，保留独立撤单和重试节流。
+            log.info("pre-send replan %s: %s/%s -> %s/%s; defer to next loop",
+                     coin, plan.mode, plan.stage, fresh_plan.mode, fresh_plan.stage)
+            return {"blocked": True}
+        plan = fresh_plan
+        if not plan.intents:
+            return {"blocked": True}
+        if not reducing and (not self.entry_allowed() or (
+            self.session is None and self.deadman_until - time.time() < DEADMAN_REMAIN_LT_S
+        )):
+            return {"blocked": True}
         specs = []
         pending: list[tuple[str, Any]] = []
         for intent in plan.intents:
@@ -806,6 +827,14 @@ class LiveQuoter:
             return None
         self._fee_banner(coin)
         payload = self.signer.signed_orders(specs)
+        # 签名期间收到成交推送，原仓位快照立即失效；减仓单也不能使用它。
+        if not self.position_fresh() or self.unknown_write:
+            return {"blocked": True}
+        log.info("ORDER_SEND coin=%s stage=%s hold_age_ms=%d book_time=%s "
+                 "bid=%s ask=%s intents=%s", coin, plan.stage, plan.age_ms,
+                 top.time, top.bid, top.ask,
+                 [(i.side, i.px, i.sz, i.tif, i.reduce_only) for _, i in pending])
+        send_started = time.monotonic()
         try:
             resp = self._post(payload, purpose="exit" if reducing else "entry", actions=len(specs))
         except RateLimited:
@@ -816,6 +845,9 @@ class LiveQuoter:
             for idx, (side, intent) in enumerate(pending):
                 self.rests[coin][side] = RestSlot(cloid=specs[idx][4], px=intent.px, sz=intent.sz)
             raise
+        finally:
+            log.info("ORDER_RETURN coin=%s elapsed_ms=%.1f", coin,
+                     (time.monotonic() - send_started) * 1000)
         if not action_ok(resp):
             if plan.take:
                 log.warning("IOC flatten failed %s %s", coin, resp)
@@ -825,20 +857,24 @@ class LiveQuoter:
                 self.last_plan_key[coin] = ""
                 return {"aloReject": True, "resp": resp}
             log.warning("order not ok %s %s", coin, resp)
-            return {"resp": resp}
+            return {"rejected": True, "resp": resp}
         statuses = resp_statuses(resp)
         if len(statuses) > len(pending):
             self.unknown_write = True
             self.halt_entries("unexpected extra order statuses; reconcile manually")
         now = time.time()
         accepted = 0
+        rejected = 0
+        alo_rejected = False
         for idx, (_side, intent) in enumerate(pending):
             st = statuses[idx] if idx < len(statuses) else None
             err = status_error(st)
             if err:
+                rejected += 1
                 if is_weight_limit_error(err):
                     self._trip_weight_backoff(err)
                 if is_alo_reject(err):
+                    alo_rejected = True
                     log.warning("ALO px rejected, will requote %s %s", coin, err)
                     self.last_plan_key[coin] = ""
                     continue
@@ -882,7 +918,8 @@ class LiveQuoter:
             [(i.side, i.px, i.sz, i.tif, "ro" if i.reduce_only else "") for i in plan.intents],
         )
         self._diag_quotes(coin, accepted, take=plan.take)
-        return {"resp": resp}
+        return {"resp": resp, "rejected": rejected > 0, "aloReject": alo_rejected,
+                "blocked": self.unknown_write, "planKey": plan.key()}
 
     def requote(self, coin: str, top: BookTop) -> None:
         plan_started = time.time()
@@ -1041,10 +1078,12 @@ class LiveQuoter:
             log.warning("place failed %s: %s", coin, exc)
             self._mark_replaced(coin)
             return
-        if placed and (placed.get("aloReject") or placed.get("blocked")):
+        if not placed or placed.get("aloReject") or placed.get("rejected") or placed.get("blocked"):
+            self.last_plan_key[coin] = ""
             self._mark_replaced(coin)
             return
-        self.last_plan_key[coin] = key
+        # _place 可能用新盘口重算过；缓存必须对应实际发出的计划。
+        self.last_plan_key[coin] = placed["planKey"]
         self.quote_placed_at[coin] = time.time() if plan.mode == "flat" else 0.0
         self._mark_replaced(coin)
         self.maybe_deadman()
