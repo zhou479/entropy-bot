@@ -16,6 +16,8 @@ log = logging.getLogger("entropy_bot.ws")
 
 BookCallback = Callable[[str, dict[str, Any]], None]
 UserFillsCallback = Callable[[dict[str, Any]], None]
+OrderUpdatesCallback = Callable[[list[dict[str, Any]]], None]
+AssetCtxCallback = Callable[[str, dict[str, Any]], None]
 
 
 class BookFeed:
@@ -26,12 +28,16 @@ class BookFeed:
         on_book: BookCallback,
         user: str | None = None,
         on_user_fills: UserFillsCallback | None = None,
+        on_order_updates: OrderUpdatesCallback | None = None,
+        on_asset_ctx: AssetCtxCallback | None = None,
     ) -> None:
         self.ws_url = ws_url
         self.coins = tuple(assert_tradable(c) for c in coins)
         self.on_book = on_book
         self.user = user
         self.on_user_fills = on_user_fills
+        self.on_order_updates = on_order_updates
+        self.on_asset_ctx = on_asset_ctx
         self.books: dict[str, dict[str, Any]] = {}
         self.book_ts: dict[str, float] = {}
         self.last_msg_ts: float = 0.0
@@ -108,7 +114,23 @@ class BookFeed:
                     }
                 )
             )
-            log.info("subscribed userFills observe-only")
+            log.info("subscribed userFills")
+        if self.user and self.on_order_updates is not None:
+            ws.send(
+                json.dumps(
+                    {
+                        "method": "subscribe",
+                        "subscription": {"type": "orderUpdates", "user": self.user},
+                    }
+                )
+            )
+            log.info("subscribed orderUpdates")
+        if self.on_asset_ctx is not None:
+            for coin in self.coins:
+                sub = {"method": "subscribe", "subscription": {"type": "activeAssetCtx", "coin": coin}}
+                assert_no_foreign_venue(sub)
+                ws.send(json.dumps(sub))
+                log.info("subscribed activeAssetCtx %s", coin)
         self._ready.set()
 
     def _on_message(self, _ws: websocket.WebSocketApp, message: str) -> None:
@@ -130,6 +152,24 @@ class BookFeed:
                     self.on_user_fills(data)
                 except Exception as exc:  # noqa: BLE001
                     log.warning("userFills callback: %s", exc)
+            return
+        if payload.get("channel") == "orderUpdates":
+            rows = payload.get("data")
+            if isinstance(rows, list) and self.on_order_updates is not None:
+                try:
+                    self.on_order_updates([r for r in rows if isinstance(r, dict)])
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("orderUpdates callback: %s", exc)
+            return
+        if payload.get("channel") == "activeAssetCtx":
+            data = payload.get("data") or {}
+            coin = data.get("coin") if isinstance(data, dict) else None
+            ctx = data.get("ctx") if isinstance(data, dict) else None
+            if coin in self.coins and isinstance(ctx, dict) and self.on_asset_ctx is not None:
+                try:
+                    self.on_asset_ctx(coin, ctx)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("activeAssetCtx callback: %s", exc)
             return
         if payload.get("channel") != "l2Book":
             return

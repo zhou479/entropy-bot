@@ -26,6 +26,14 @@ class RequestWeightLimited(RateLimited):
     """
 
 
+class ExchangeUncertain(RateLimited):
+    """`/exchange` timed out or the connection dropped mid-request.
+
+    The action may or may not have been accepted. Callers must reconcile open
+    orders before placing again on that coin.
+    """
+
+
 def error_text(value: object) -> str:
     if value is None:
         return ""

@@ -9,7 +9,13 @@ from typing import Any
 import requests
 
 from entropy_bot.coins import ALLOWED_DEX, assert_no_foreign_venue, assert_tradable
-from entropy_bot.errors import RateLimited, RequestWeightLimited, error_text, is_weight_limit_error
+from entropy_bot.errors import (
+    ExchangeUncertain,
+    RateLimited,
+    RequestWeightLimited,
+    error_text,
+    is_weight_limit_error,
+)
 
 log = logging.getLogger("entropy_bot.rest")
 
@@ -18,9 +24,18 @@ INFO_PAUSE_S = 0.15
 
 
 class InfoClient:
-    def __init__(self, base_url: str, *, timeout: float = DEFAULT_TIMEOUT) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        timeout: float = DEFAULT_TIMEOUT,
+        pause_s: float = INFO_PAUSE_S,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        # Courtesy sleep after uncached info calls. Live passes 0: its polls are
+        # already interval-gated and the sleep only delays requotes.
+        self.pause_s = pause_s
         self.session = requests.Session()
         self._perp_dexs: list[Any] | None = None
         self._meta: dict[str, Any] | None = None
@@ -58,8 +73,8 @@ class InfoClient:
         if not response.content or response.content.strip() in {b"", b"null"}:
             return None
         data = response.json()
-        if not cacheable:
-            time.sleep(INFO_PAUSE_S)
+        if not cacheable and self.pause_s > 0:
+            time.sleep(self.pause_s)
         return data
 
     def perp_dexs(self, *, refresh: bool = False) -> list[Any]:
@@ -138,6 +153,32 @@ class InfoClient:
             raise ValueError("userFills expected a list")
         return [row for row in data if isinstance(row, dict)]
 
+    def user_fills_by_time(
+        self,
+        user: str,
+        start_ms: int,
+        *,
+        optional: bool = True,
+    ) -> list[dict[str, Any]] | None:
+        """Fills since `start_ms` only. Cheaper than `userFills` (weight grows per 20 rows)."""
+        data = self.post_info(
+            {"type": "userFillsByTime", "user": user, "startTime": int(start_ms)},
+            optional=optional,
+        )
+        if data is None:
+            return None
+        if not isinstance(data, list):
+            if optional:
+                log.warning("userFillsByTime returned non-list; treating as null")
+                return None
+            raise ValueError("userFillsByTime expected a list")
+        return [row for row in data if isinstance(row, dict)]
+
+    def user_rate_limit(self, user: str, *, optional: bool = True) -> dict[str, Any] | None:
+        """Address request budget: cumVlm, nRequestsUsed, nRequestsCap, nRequestsSurplus."""
+        data = self.post_info({"type": "userRateLimit", "user": user}, optional=optional)
+        return data if isinstance(data, dict) else None
+
     def extra_agents(self, user: str, *, optional: bool = True) -> list[Any] | None:
         data = self.post_info({"type": "extraAgents", "user": user}, optional=optional, cacheable=True)
         if data is None:
@@ -150,7 +191,8 @@ class InfoClient:
         try:
             response = self.session.post(url, json=payload, timeout=self.timeout)
         except requests.RequestException as exc:
-            raise RateLimited(f"exchange request failed: {exc}") from exc
+            # Timeout / reset: the action may already be on the book.
+            raise ExchangeUncertain(f"exchange request failed: {exc}") from exc
         if response.status_code == 429:
             text = response.text or "exchange 429"
             if is_weight_limit_error(text):

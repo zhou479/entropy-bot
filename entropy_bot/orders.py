@@ -14,13 +14,13 @@ Agent vs master (official SDK, not a guess):
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Any, Literal
 
 from eth_account import Account
 from eth_account.signers.local import LocalAccount
 from hyperliquid.utils.signing import (
-    get_timestamp_ms,
     order_request_to_order_wire,
     order_wires_to_order_action,
     sign_l1_action,
@@ -209,6 +209,31 @@ def update_leverage_action(market: Market, leverage: int) -> dict[str, Any]:
     }
 
 
+class NonceClock:
+    """Millisecond nonces that never repeat or go backwards within this process.
+
+    Hyperliquid rejects a reused nonce. Two actions signed in the same
+    millisecond (cancel then place) would otherwise collide.
+    """
+
+    def __init__(self) -> None:
+        self._last = 0
+        self._lock = threading.Lock()
+
+    def next(self) -> int:
+        with self._lock:
+            now = int(time.time() * 1000)
+            self._last = max(now, self._last + 1)
+            return self._last
+
+
+_NONCES = NonceClock()
+
+
+def next_nonce() -> int:
+    return _NONCES.next()
+
+
 def sign_and_wrap(
     wallet: LocalAccount,
     action: dict[str, Any],
@@ -218,7 +243,7 @@ def sign_and_wrap(
 ) -> dict[str, Any]:
     """Sign an L1 action. `vault_address` is vault/subaccount only — never the master for an agent."""
     assert_no_foreign_venue(action)
-    nonce = get_timestamp_ms()
+    nonce = next_nonce()
     signature = sign_l1_action(wallet, action, vault_address, nonce, None, is_mainnet)
     payload: dict[str, Any] = {
         "action": action,

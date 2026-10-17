@@ -1,0 +1,28 @@
+# systemd unit for the live bot. Copy to /etc/systemd/system/, then:
+#   sudo systemctl daemon-reload && sudo systemctl enable --now entropy-bot
+#   journalctl -u entropy-bot -f | grep FILL_DIAG
+# Adjust User / WorkingDirectory to your VPS layout. Secrets stay in .env.
+[Unit]
+Description=entropy-bot live MM (io:SNDK)
+After=network-online.target time-sync.target
+Wants=network-online.target
+# A crash loop must not hammer the request budget.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=entropy
+WorkingDirectory=/home/entropy/entropy-bot
+ExecStart=/home/entropy/entropy-bot/.venv/bin/python -m entropy_bot live
+# SIGTERM → clean stop: cancel rests, clear the dead-man.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=15
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

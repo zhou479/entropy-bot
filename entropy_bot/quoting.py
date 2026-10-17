@@ -268,12 +268,26 @@ def flatten_size(abs_szi: float, notional_sz: float, sz_decimals: int) -> float:
     return floor_size(use, sz_decimals)
 
 
-def flatten_prices(market: Market, top: BookTop, stage: Stage) -> tuple[float, float] | None:
+def flatten_prices(
+    market: Market,
+    top: BookTop,
+    stage: Stage,
+    *,
+    take_slippage_ticks: int = 0,
+) -> tuple[float, float] | None:
     if top.bid is None or top.ask is None or top.bid <= 0 or top.ask <= 0:
         return None
     tick = top.inferred_tick(market.sz_decimals)
     if stage == "take":
-        return top.ask, top.bid  # short cover @ask / long exit @bid
+        # short cover @ask(+slip) / long exit @bid(-slip). A few ticks of room
+        # keeps a thin top level from turning every IOC into a miss.
+        slip = max(0, int(take_slippage_ticks)) * tick
+        buy = _round_side(ceil_to_tick(top.ask + slip, tick), market.sz_decimals, side="ask")
+        sell = top.bid - slip
+        if sell <= 0:
+            sell = top.bid
+        sell = _round_side(floor_to_tick(sell, tick), market.sz_decimals, side="bid")
+        return buy, sell
     if stage == "mid":
         mid = top.mid if top.mid and top.mid > 0 else (top.bid + top.ask) / 2.0
         mid_px = _round_side(mid, market.sz_decimals, side="nearest")
@@ -297,6 +311,7 @@ def quote_plan(
     szi: float,
     age_ms: int,
     notional_usd: float,
+    take_slippage_ticks: int = 0,
 ) -> QuotePlan:
     stage = flatten_stage(age_ms, szi)
     if abs(szi) <= 0:
@@ -319,7 +334,7 @@ def quote_plan(
 
     take = stage == "take"
     tif = "Ioc" if take else "Alo"
-    raw = flatten_prices(market, top, stage)
+    raw = flatten_prices(market, top, stage, take_slippage_ticks=take_slippage_ticks)
     if raw is None:
         return QuotePlan(market.coin, "long" if szi > 0 else "short", stage, tif, take, [], age_ms, szi)
     buy_raw, sell_raw = raw
