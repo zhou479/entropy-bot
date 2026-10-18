@@ -29,6 +29,7 @@ DEFAULT_REQUOTE_TOLERANCE_TICKS = 1
 DEFAULT_STALE_QUOTE_S = 120.0
 DEFAULT_TAKE_SLIPPAGE_TICKS = 0
 DEFAULT_MAX_POSITION_MULT = 3.0
+DEFAULT_ORACLE_MAX_DEV_BPS = 50.0
 MIN_ORDER_USD = MIN_NOTIONAL_USD
 
 
@@ -59,6 +60,12 @@ class Settings:
     take_slippage_ticks: int = DEFAULT_TAKE_SLIPPAGE_TICKS
     # 仓位名义金额达到这个值就跳过 ALO 阶梯直接 IOC。None = 3 x QUOTE_NOTIONAL_USD。
     max_position_usd: float | None = None
+    # 盘口 mid 偏离 oraclePx 超过 N bp 时不挂开仓单（有仓照常平）。0 = 关闭。
+    oracle_max_dev_bps: float = DEFAULT_ORACLE_MAX_DEV_BPS
+    # 只在纽约正常交易时段挂开仓单的币，如 "io:SNDK"。默认空 = 不限时段。
+    rth_only_coins: tuple[str, ...] = ()
+    # 本次运行已实现净亏损（closedPnl - fee）达到 N 美元就停止开仓并收尾。0 = 关闭。
+    max_session_loss_usd: float = 0.0
 
     @property
     def paper(self) -> bool:
@@ -107,6 +114,8 @@ def load_settings(dotenv_path: str | Path | None = None) -> Settings:
         take_slip = int(os.environ.get("TAKE_SLIPPAGE_TICKS", DEFAULT_TAKE_SLIPPAGE_TICKS))
         max_pos_raw = _optional_env("MAX_POSITION_USD")
         max_pos = float(max_pos_raw) if max_pos_raw is not None else None
+        oracle_dev = float(os.environ.get("ORACLE_MAX_DEV_BPS", DEFAULT_ORACLE_MAX_DEV_BPS))
+        max_loss = float(os.environ.get("MAX_SESSION_LOSS_USD", "0") or 0)
     except ValueError as exc:
         raise ConfigError(f"invalid numeric config: {exc}") from exc
     if notional <= 0 or offset < 0 or max_lev < 1:
@@ -117,6 +126,10 @@ def load_settings(dotenv_path: str | Path | None = None) -> Settings:
         raise ConfigError("REQUOTE_TOLERANCE_TICKS, STALE_QUOTE_S, TAKE_SLIPPAGE_TICKS must be >= 0")
     if max_pos is not None and max_pos <= 0:
         raise ConfigError("MAX_POSITION_USD must be > 0 when set")
+    if oracle_dev < 0 or max_loss < 0:
+        raise ConfigError("ORACLE_MAX_DEV_BPS and MAX_SESSION_LOSS_USD must be >= 0")
+    rth_raw = os.environ.get("RTH_ONLY_COINS", "")
+    rth_only = validate_coin_list(c.strip() for c in rth_raw.split(",") if c.strip()) if rth_raw.strip() else ()
     rates_for_tier(fee_tier)
     entropy_program(entropy_tier)
     if not 0.0 <= referral < 1.0:
@@ -149,6 +162,9 @@ def load_settings(dotenv_path: str | Path | None = None) -> Settings:
         stale_quote_s=stale_quote_s,
         take_slippage_ticks=take_slip,
         max_position_usd=max_pos,
+        oracle_max_dev_bps=oracle_dev,
+        rth_only_coins=rth_only,
+        max_session_loss_usd=max_loss,
     )
 
 

@@ -256,3 +256,82 @@ def test_position_over_cap_skips_the_alo_ladder(setup):
     client.state = {"assetPositions": [{"position": {"coin": COIN, "szi": "0.03"}}]}
     q.refresh_positions(force=True)
     assert q.plan_for(COIN, _top("1293.8", "1293.9", COIN)).stage == "far"
+
+
+def _gated(markets, monkeypatch, **kw):
+    clock = Clock()
+    monkeypatch.setattr("entropy_bot.live.time.time", clock.time)
+    client = BookKeepingClient()
+    q = LiveQuoter(_settings(coins=(COIN,), **kw), {COIN: markets[COIN]}, client, FakeSigner())
+    q.preflight()
+    q.deadman_until = clock.t + 10_000
+    return clock, client, q
+
+
+def test_oracle_deviation_pauses_and_resumes_entries(markets, monkeypatch):
+    clock, client, q = _gated(markets, monkeypatch, oracle_max_dev_bps=50.0)
+    q.on_asset_ctx(COIN, {"oraclePx": "1280.0"})  # ~107 bp away
+    quote(q, "1293.8", "1293.9")
+    assert not client.posts
+    assert not q.entry_halt, "偏离只是暂停，不能锁死"
+    q.on_asset_ctx(COIN, {"oraclePx": "1293.9"})
+    clock.advance(5.1)
+    quote(q, "1293.8", "1293.9")
+    assert actions(client) == [("order", 2)]
+
+
+def test_oracle_deviation_cancels_resting_quotes(markets, monkeypatch):
+    clock, client, q = _gated(markets, monkeypatch, oracle_max_dev_bps=50.0)
+    quote(q, "1293.8", "1293.9")
+    client.posts.clear()
+    q.on_asset_ctx(COIN, {"oraclePx": "1250.0"})
+    clock.advance(1)
+    quote(q, "1293.8", "1293.9")
+    assert actions(client) == [("cancel", 2)]
+
+
+def test_stale_or_missing_oracle_does_not_block(markets, monkeypatch):
+    clock, client, q = _gated(markets, monkeypatch, oracle_max_dev_bps=50.0)
+    q.on_asset_ctx(COIN, {"oraclePx": "1000.0"})
+    clock.advance(31)  # 超过 30s 没更新：不拿它判断
+    quote(q, "1293.8", "1293.9")
+    assert actions(client) == [("order", 2)]
+
+
+def test_rth_only_is_opt_in(markets, monkeypatch):
+    monkeypatch.setattr("entropy_bot.live.is_rth", lambda: False)
+    _, client, q = _gated(markets, monkeypatch)
+    quote(q, "1293.8", "1293.9")
+    assert actions(client) == [("order", 2)], "默认不限时段"
+    _, client2, q2 = _gated(markets, monkeypatch, rth_only_coins=(COIN,))
+    quote(q2, "1293.8", "1293.9")
+    assert not client2.posts
+
+
+def test_rth_gate_still_flattens_positions(markets, monkeypatch):
+    monkeypatch.setattr("entropy_bot.live.is_rth", lambda: False)
+    clock, client, q = _gated(markets, monkeypatch, rth_only_coins=(COIN,))
+    client.state = {"assetPositions": [{"position": {"coin": COIN, "szi": "0.0386"}}]}
+    q.refresh_positions(force=True)
+    q.pos_since[COIN] = clock.t
+    quote(q, "1293.8", "1293.9")
+    placed = [spec for p in client.posts if p["action"]["type"] == "order" for spec in p["action"]["orders"]]
+    assert len(placed) == 1 and placed[0][-2] is True
+
+
+def test_session_loss_limit_halts_entries(markets, monkeypatch):
+    _, _, q = _gated(markets, monkeypatch, max_session_loss_usd=5.0)
+    q.diag.ingest_fills([], lambda _c: None, prime=True)
+    q.diag.ingest_fills([{"coin": COIN, "side": "A", "px": "1290", "sz": "0.04", "tid": 9,
+                          "crossed": True, "fee": "0.5", "closedPnl": "-5.0"}], lambda _c: None)
+    q.step(None)
+    assert "MAX_SESSION_LOSS_USD" in q.entry_halt
+    assert not q.entry_allowed()
+
+
+def test_session_loss_ignores_fills_from_before_start(markets, monkeypatch):
+    _, _, q = _gated(markets, monkeypatch, max_session_loss_usd=5.0)
+    q.diag.ingest_fills([{"coin": COIN, "side": "A", "px": "1290", "sz": "0.04", "tid": 1,
+                          "fee": "0", "closedPnl": "-50"}], lambda _c: None, prime=True)
+    q.step(None)
+    assert not q.entry_halt

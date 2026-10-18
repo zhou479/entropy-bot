@@ -50,6 +50,7 @@ from entropy_bot.errors import (ExchangeOutcomeUnknown, LiveGuardError, RateLimi
                                 RequestWeightLimited, is_weight_limit_error)
 from entropy_bot.safety import (BUDGET_POLL_S, HTTP_BACKOFF_S, LIMITED_EXIT_GAP_S,
                                 RequestBudget, cancel_confirmed)
+from entropy_bot.market_hours import is_rth
 from entropy_bot.rest import InfoClient
 from entropy_bot.status import load_io_markets
 from entropy_bot.session import SupervisedSession
@@ -58,6 +59,7 @@ from entropy_bot.ws import BookFeed
 log = logging.getLogger("entropy_bot.live")
 
 WS_STALE_S = 15.0
+ORACLE_STALE_S = 30.0  # activeAssetCtx 超过这么久没更新，就不拿它做偏离检查
 POS_POLL_S = 0.8
 FILL_POLL_S = 30.0  # WS 保持逐笔诊断；REST 仅低频补漏，避免抢占查询权重。
 LOOP_S = 0.4
@@ -373,6 +375,8 @@ class LiveQuoter:
     _reject_until: dict[tuple[str, str], float] = field(default_factory=dict)
     _reject_streak: dict[tuple[str, str], int] = field(default_factory=dict)
     _maxpos_logged: dict[str, bool] = field(default_factory=dict)
+    asset_ctx: dict[str, tuple[float, dict[str, Any]]] = field(default_factory=dict)
+    _block_logged: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.notional:
@@ -487,6 +491,46 @@ class LiveQuoter:
     def on_book(self, coin: str, data: dict[str, Any]) -> None:
         with self._lock:
             self.books[coin] = (time.time(), data)
+
+    def on_asset_ctx(self, coin: str, ctx: dict[str, Any]) -> None:
+        with self._lock:
+            self.asset_ctx[coin] = (time.time(), ctx)
+
+    def entry_block_reason(self, coin: str, top: BookTop) -> str:
+        """按币暂停开仓的原因（不锁死：条件恢复后自动继续）。有仓位时照常减仓。"""
+        if coin in self.settings.rth_only_coins and not is_rth():
+            return "outside NYSE regular hours (RTH_ONLY_COINS)"
+        max_dev = self.settings.oracle_max_dev_bps
+        if max_dev > 0 and top.mid:
+            with self._lock:
+                entry = self.asset_ctx.get(coin)
+            if entry is not None and time.time() - entry[0] <= ORACLE_STALE_S:
+                try:
+                    oracle = float(entry[1].get("oraclePx"))
+                except (TypeError, ValueError):
+                    oracle = 0.0
+                if oracle > 0 and math.isfinite(oracle):
+                    dev = abs(top.mid - oracle) / oracle * 10_000.0
+                    if dev > max_dev:
+                        return f"book mid {top.mid:g} is {dev:.1f} bp from oracle {oracle:g}"
+        return ""
+
+    def _note_block(self, coin: str, reason: str) -> None:
+        if self._block_logged.get(coin, "") == reason:
+            return
+        if reason:
+            log.warning("ENTRY PAUSE %s: %s", coin, reason)
+        else:
+            log.info("ENTRY RESUME %s", coin)
+        self._block_logged[coin] = reason
+
+    def check_session_loss(self) -> None:
+        limit = self.settings.max_session_loss_usd
+        if limit <= 0 or self.diag is None:
+            return
+        pnl = self.diag.run_net_pnl()
+        if pnl <= -limit:
+            self.halt_entries(f"session realized net PnL {pnl:.2f} <= -MAX_SESSION_LOSS_USD {limit:g}")
 
     def peek_book(self, coin: str) -> BookSnap | None:
         """Cache/WS l2Book only. Diagnostics must not open a WS or REST-fallback."""
@@ -1055,7 +1099,10 @@ class LiveQuoter:
             self.cancel_coin_rests(only_coin=coin)
             return
         plan = self.plan_for(coin, top)
-        if plan.mode == "flat" and not self.entry_allowed():
+        block = self.entry_block_reason(coin, top) if plan.mode == "flat" else ""
+        if plan.mode == "flat":
+            self._note_block(coin, block)
+        if plan.mode == "flat" and (block or not self.entry_allowed()):
             self.next_safety_poll[coin] = time.time() + 5.0
             self.cancel_coin_rests(only_coin=coin)
             return
@@ -1244,6 +1291,7 @@ class LiveQuoter:
 
     def step(self, feed: BookFeed | None) -> None:
         self._feed = feed
+        self.check_session_loss()
         try:
             self.refresh_positions()
         except Exception as exc:  # noqa: BLE001
@@ -1453,6 +1501,7 @@ def run_live(settings: Settings, *, seconds: float | None = None,
             quoter.on_book,
             user=signer.account,
             on_user_fills=quoter.on_user_fills,
+            on_asset_ctx=quoter.on_asset_ctx,
         )
         quoter._feed = feed
         feed.start()
