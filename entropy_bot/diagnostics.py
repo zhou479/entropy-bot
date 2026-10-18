@@ -2,10 +2,13 @@
 
 Logging only. Does not choose prices, sizes, cancels, or dead-man timing.
 
-Holidays: no NYSE calendar. A weekday 09:30–16:00 America/New_York is `rth`
-even if the cash session is closed. Everything else (nights, weekends) is `ah`.
-AH markout is labeled and kept in its own SNDK bucket; it is never folded into
-an RTH average.
+Sessions use the static NYSE calendar in `entropy_bot.market_hours` (holidays and
+13:00 early closes). Everything outside regular hours is `ah`. AH markout is
+labeled and kept in its own SNDK bucket; it is never folded into an RTH average.
+
+`fills` counts distinct maker orders (oid) so a partially filled quote counts
+once and `fill_rate` stays <= 1. IOC flatten fills (`crossed`) are reported but
+not counted against quotes. Net PnL (`closedPnl - fee`) is tracked per UTC day.
 """
 
 from __future__ import annotations
@@ -14,14 +17,15 @@ import json
 import logging
 import threading
 import time as time_mod
+from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, time, timezone
+from datetime import datetime, timezone
 from typing import Any, Callable
-from zoneinfo import ZoneInfo
 
 from entropy_bot.coins import ALLOWED_COINS
 from entropy_bot.precision import spread_bps as spread_bps_vs_mid
 from entropy_bot.quoting import BookTop
+from entropy_bot.market_hours import nyse_session
 
 log = logging.getLogger("entropy_bot.diagnostics")
 
@@ -30,9 +34,10 @@ SNDK = "io:SNDK"
 DIAG_COINS = ALLOWED_COINS
 MARKOUT_WAIT_S = 3.0
 BOOK_STALE_S = 15.0
-NY_TZ = ZoneInfo("America/New_York")
-RTH_START = time(9, 30)
-RTH_END = time(16, 0)
+# Long-running VPS process: keep memory flat.
+MAX_ROWS = 500
+MAX_SEEN = 20_000
+MAX_MARKOUTS = 5_000
 
 PeekBook = Callable[[str], "BookSnap | None"]
 
@@ -60,6 +65,9 @@ class PendingMarkout:
     session: str | None
     due_at: float
     fill_key: str
+    crossed: bool = False
+    fee: float | None = None
+    closed_pnl: float | None = None
 
 
 def markout_bps(side: str, fill_px: float, mid_3s: float) -> float:
@@ -84,18 +92,8 @@ def fill_rate(fills: int, quotes: int) -> float | None:
 
 
 def sndk_session(when: datetime | None = None) -> str:
-    """`rth` = Mon–Fri 09:30–16:00 America/New_York; else `ah`. No holiday calendar."""
-    dt = datetime.now(NY_TZ) if when is None else when
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=NY_TZ)
-    else:
-        dt = dt.astimezone(NY_TZ)
-    if dt.weekday() >= 5:
-        return "ah"
-    clock = dt.timetz().replace(tzinfo=None)
-    if RTH_START <= clock < RTH_END:
-        return "rth"
-    return "ah"
+    """`rth` inside NYSE regular hours (holidays / early closes honored); else `ah`."""
+    return nyse_session(when)
 
 
 def session_for(coin: str, when: datetime | None = None) -> str | None:
@@ -158,6 +156,20 @@ def fill_key(row: dict[str, Any]) -> str:
     return "row:" + "|".join("" if p is None else str(p) for p in parts)
 
 
+def _opt_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def utc_day(when: datetime | None = None) -> str:
+    dt = datetime.now(timezone.utc) if when is None else when.astimezone(timezone.utc)
+    return dt.date().isoformat()
+
+
 def snap_from_top(top: BookTop | None, age_s: float) -> BookSnap:
     if top is None or top.bid is None or top.ask is None or top.bid <= 0 or top.ask <= 0:
         return BookSnap(mid=None, spread=None, spread_bps=None, age_s=age_s)
@@ -182,11 +194,17 @@ class FillDiagnostics:
     coins: tuple[str, ...] = DIAG_COINS
     quotes: dict[tuple[str, str | None], int] = field(default_factory=dict)
     fills: dict[tuple[str, str | None], int] = field(default_factory=dict)
-    markouts: dict[tuple[str, str | None], list[float]] = field(default_factory=dict)
+    markouts: dict[tuple[str, str | None], deque[float]] = field(default_factory=dict)
     seen: set[str] = field(default_factory=set)
     pending: list[PendingMarkout] = field(default_factory=list)
-    rows: list[dict[str, Any]] = field(default_factory=list)
+    rows: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=MAX_ROWS))
     primed: bool = False
+    filled_oids: set[str] = field(default_factory=set)
+    taker_fills: dict[str, int] = field(default_factory=dict)
+    day_pnl: dict[str, float] = field(default_factory=dict)
+    run_pnl: float = 0.0  # 本进程启动后（非快照）成交的 closedPnl - fee 合计
+    _seen_order: deque[str] = field(default_factory=deque)
+    _filled_order: deque[str] = field(default_factory=deque)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def __post_init__(self) -> None:
@@ -196,12 +214,12 @@ class FillDiagnostics:
                     key = (coin, session)
                     self.quotes.setdefault(key, 0)
                     self.fills.setdefault(key, 0)
-                    self.markouts.setdefault(key, [])
+                    self.markouts.setdefault(key, deque(maxlen=MAX_MARKOUTS))
             else:
                 key = (coin, None)
                 self.quotes.setdefault(key, 0)
                 self.fills.setdefault(key, 0)
-                self.markouts.setdefault(key, [])
+                self.markouts.setdefault(key, deque(maxlen=MAX_MARKOUTS))
 
     def bucket(self, coin: str, session: str | None = None) -> tuple[str, str | None]:
         if coin == SNDK:
@@ -225,7 +243,25 @@ class FillDiagnostics:
         if marks:
             row["markout_n"] = len(marks)
             row["markout_avg_bps"] = sum(marks) / len(marks)
+        taker = self.taker_fills.get(coin, 0)
+        if taker:
+            row["taker_fills"] = taker
+        day = utc_day()
+        if day in self.day_pnl:
+            row["day_net_pnl"] = self.day_pnl[day]
         return row
+
+    def run_net_pnl(self) -> float:
+        """本次运行（会话）已实现净盈亏：只算启动后的成交，不含浮动盈亏。"""
+        with self._lock:
+            return self.run_pnl
+
+
+    def _remember(self, bucket: set[str], order: deque[str], key: str) -> None:
+        bucket.add(key)
+        order.append(key)
+        while len(order) > MAX_SEEN:
+            bucket.discard(order.popleft())
 
     def note_quotes(self, coin: str, n: int, *, when: datetime | None = None) -> dict[str, Any] | None:
         coin_n = normalize_diag_coin(coin)
@@ -248,6 +284,9 @@ class FillDiagnostics:
         now: float | None = None,
         when: datetime | None = None,
     ) -> list[PendingMarkout]:
+        # 只有第一份快照算"启动前的历史"。WS 每次重连都会重发快照，
+        # 之后快照里没见过的成交是断线期间发生的，必须照常计入（包括会话盈亏）。
+        prime = prime and not self.primed
         if not raw_fills:
             if prime:
                 self.primed = True
@@ -298,15 +337,32 @@ class FillDiagnostics:
             fill_px = 0.0
         if coin is None or side is None or fill_px <= 0:
             return None
+        fill_when = when_from_fill(raw, when)
+        crossed = bool(raw.get("crossed"))
+        fee = _opt_float(raw.get("fee"))
+        closed = _opt_float(raw.get("closedPnl"))
         with self._lock:
             if key in self.seen:
                 return None
-            self.seen.add(key)
+            self._remember(self.seen, self._seen_order, key)
+            day = utc_day(fill_when)
+            # 只用于 FILL_DIAG 里的 day_net_pnl 展示：当天启动前的成交也算进当天合计。
+            # （风控用的是 run_pnl，只算启动后的成交。）
+            if not prime or day == utc_day():
+                self.day_pnl[day] = self.day_pnl.get(day, 0.0) + (closed or 0.0) - (fee or 0.0)
             if prime:
                 return None
-            session = session_for(coin, when_from_fill(raw, when))
+            self.run_pnl += (closed or 0.0) - (fee or 0.0)
+            session = session_for(coin, fill_when)
             bkey = self.bucket(coin, session)
-            self.fills[bkey] = self.fills.get(bkey, 0) + 1
+            if crossed:
+                self.taker_fills[coin] = self.taker_fills.get(coin, 0) + 1
+            else:
+                oid = raw.get("oid")
+                okey = f"oid:{oid}" if oid is not None else key
+                if okey not in self.filled_oids:
+                    self._remember(self.filled_oids, self._filled_order, okey)
+                    self.fills[bkey] = self.fills.get(bkey, 0) + 1
         snap = None
         try:
             snap = peek_book(coin)
@@ -324,6 +380,9 @@ class FillDiagnostics:
             session=session,
             due_at=ts + MARKOUT_WAIT_S,
             fill_key=key,
+            crossed=crossed,
+            fee=fee,
+            closed_pnl=closed,
         )
         with self._lock:
             self.pending.append(pending)
@@ -345,7 +404,9 @@ class FillDiagnostics:
                 mark = None
         if mark is not None:
             with self._lock:
-                bucket = self.markouts.setdefault(self.bucket(item.coin, item.session), [])
+                bucket = self.markouts.setdefault(
+                    self.bucket(item.coin, item.session), deque(maxlen=MAX_MARKOUTS)
+                )
                 bucket.append(mark)
         with self._lock:
             counters = self.snapshot(item.coin, item.session)
@@ -359,6 +420,9 @@ class FillDiagnostics:
             "markout_bps": mark,
             "spread": item.spread,
             "spread_bps": item.spread_bps,
+            "crossed": item.crossed,
+            "fee": item.fee,
+            "closed_pnl": item.closed_pnl,
             "quotes": counters["quotes"],
             "fills": counters["fills"],
             "fill_rate": counters["fill_rate"],
@@ -367,11 +431,14 @@ class FillDiagnostics:
             row["session"] = item.session
         if "markout_avg_bps" in counters:
             row["markout_avg_bps"] = counters["markout_avg_bps"]
+        if "day_net_pnl" in counters:
+            row["day_net_pnl"] = counters["day_net_pnl"]
         self._emit(row)
         return row
 
     def _emit(self, row: dict[str, Any]) -> None:
         self.rows.append(row)
         line = json.dumps(row, separators=(",", ":"), ensure_ascii=False)
+        # stdout only: under systemd/tmux stdout+stderr land in one stream, so
+        # also logging it would print every row twice.
         print(f"FILL_DIAG {line}", flush=True)
-        log.info("FILL_DIAG %s", line)

@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from entropy_bot.coins import ALLOWED_DEX, Market, perp_dex_info
-from entropy_bot.config import Settings, live_notional, require_live
+from entropy_bot.config import Settings, live_notional, max_position_usd, require_live
 from entropy_bot.fees import (
     ALO_TIF_NOTE,
     alo_fill_rebate_usd,
@@ -38,7 +38,7 @@ from entropy_bot.orders import (
     status_oid,
 )
 from entropy_bot.quoting import (
-    STALE_QUOTE_MS,
+    FLAT_TAKE_MS,
     BookTop,
     QuotePlan,
     book_top,
@@ -46,10 +46,11 @@ from entropy_bot.quoting import (
     sync_pos_since,
 )
 from entropy_bot.diagnostics import BookSnap, FillDiagnostics, snap_from_top
-from entropy_bot.errors import (ExchangeOutcomeUnknown, LiveGuardError, RateLimited,
+from entropy_bot.errors import (LiveGuardError, RateLimited,
                                 RequestWeightLimited, is_weight_limit_error)
 from entropy_bot.safety import (BUDGET_POLL_S, HTTP_BACKOFF_S, LIMITED_EXIT_GAP_S,
                                 RequestBudget, cancel_confirmed)
+from entropy_bot.market_hours import is_rth
 from entropy_bot.rest import InfoClient
 from entropy_bot.status import load_io_markets
 from entropy_bot.session import SupervisedSession
@@ -58,6 +59,7 @@ from entropy_bot.ws import BookFeed
 log = logging.getLogger("entropy_bot.live")
 
 WS_STALE_S = 15.0
+ORACLE_STALE_S = 30.0  # activeAssetCtx 超过这么久没更新，就不拿它做偏离检查
 POS_POLL_S = 0.8
 FILL_POLL_S = 30.0  # WS 保持逐笔诊断；REST 仅低频补漏，避免抢占查询权重。
 LOOP_S = 0.4
@@ -68,6 +70,11 @@ DEADMAN_REMAIN_LT_S = 8.0
 DEADMAN_REFRESH_S = DEADMAN_REMAIN_LT_S  # alias: refresh only when remaining < 8s
 IOC_GAP_S = 3.0  # 首次退出仍是 >=15s；后续重试共享节流，避免 info 查询耗尽 IP 权重。
 WEIGHT_BACKOFF_FLOOR_S = 30.0
+ALO_REJECT_RETRY_S = 2.0
+# 其它拒单（保证金不足、builder 未授权、数量不对……）按侧退避 2s、4s、…、最长 60s，
+# 每轮都重试同一个必拒的单只会消耗请求额度。
+ORDER_REJECT_BASE_S = 2.0
+ORDER_REJECT_MAX_S = 60.0
 
 
 @dataclass
@@ -79,6 +86,7 @@ class RestSlot:
     tif: str = "Alo"
     reduce_only: bool = False
     placed_at: float = 0.0
+    stage: str = "flat"
 
     def occupied(self) -> bool:
         return self.oid is not None or self.cloid is not None
@@ -134,6 +142,15 @@ def apply_open_orders(
         return rests, extras
     next_rests = empty_rests(tuple(markets))
     next_extras: dict[str, list[int]] = {coin: [] for coin in markets}
+    # 已知挂单保留阶段/方向/下单时间等元数据；只有交易所列表决定它是否还在。
+    known_by_oid: dict[int, RestSlot] = {}
+    known_by_cloid: dict[str, RestSlot] = {}
+    for sides in rests.values():
+        for old in sides.values():
+            if old.oid is not None:
+                known_by_oid[old.oid] = old
+            if old.cloid:
+                known_by_cloid[old.cloid] = old
     for order in opens:
         coin = match_order_coin(order, markets)
         if coin is None or coin not in next_rests:
@@ -152,6 +169,18 @@ def apply_open_orders(
         slot = next_rests[coin][side]
         cloid = order.get("cloid") or order.get("cloidStr")
         if not slot.occupied():
+            old = known_by_oid.get(oid) or (known_by_cloid.get(cloid) if isinstance(cloid, str) else None)
+            if old is not None:
+                slot.sz, slot.tif, slot.reduce_only = old.sz, old.tif, old.reduce_only
+                slot.placed_at, slot.stage = old.placed_at, old.stage
+            else:
+                slot.stage = "unknown"  # 不知道是哪一阶段的单：下一轮按"类型不对"立即替换
+            try:  # 部分成交后交易所给的是剩余数量
+                remaining = float(order["sz"])
+                if math.isfinite(remaining) and remaining > 0:
+                    slot.sz = remaining
+            except (KeyError, TypeError, ValueError):
+                pass
             slot.oid = oid
             slot.cloid = cloid if isinstance(cloid, str) else None
             try:
@@ -273,6 +302,40 @@ def side_occupied(rests: dict[str, dict[str, RestSlot]], coin: str, side: str) -
     return bool(slot and slot.occupied())
 
 
+def slot_verdict(
+    slot: RestSlot,
+    want: Any,
+    *,
+    tick: float,
+    tolerance_ticks: int,
+    stale_quote_s: float,
+    now: float,
+) -> str:
+    """一侧已有挂单、且这一侧仍需要挂单时怎么处理。
+
+    - "keep"：离目标价不超过 tolerance_ticks 个 tick，不动（不花写请求，保留排队位置）。
+    - "now"：挂单类型不对（阶段 / TIF / reduce-only 变了），立即替换，不受 MIN_REPLACE_S 限制。
+      例如成交后空仓变多仓：整额的非减仓卖单必须马上换成 reduce-only。
+    - "slow"：只是价格偏离超过容差，或空仓挂单超过 stale_quote_s 未动；按 MIN_REPLACE_S 节流替换。
+    """
+    if (
+        slot.stage != want.stage
+        or bool(slot.reduce_only) != bool(want.reduce_only)
+        or str(slot.tif).lower() != str(want.tif).lower()
+    ):
+        return "now"
+    if slot.px is None:
+        return "slow"
+    if abs(slot.px - want.px) > max(0, int(tolerance_ticks)) * tick + 1e-9:
+        return "slow"
+    if want.reduce_only and slot.sz is not None and slot.sz < want.sz - 1e-12:
+        return "slow"  # 仓位变大了，减仓单数量跟着调
+    if (want.stage == "flat" and stale_quote_s > 0 and slot.placed_at > 0
+            and now - slot.placed_at > stale_quote_s):
+        return "slow"
+    return "keep"
+
+
 @dataclass
 class LiveQuoter:
     settings: Settings
@@ -284,8 +347,6 @@ class LiveQuoter:
     extra_oids: dict[str, list[int]] = field(default_factory=dict)
     pos: dict[str, float] = field(default_factory=dict)
     pos_since: dict[str, float] = field(default_factory=dict)
-    last_plan_key: dict[str, str] = field(default_factory=dict)
-    quote_placed_at: dict[str, float] = field(default_factory=dict)
     last_take_at: dict[str, float] = field(default_factory=dict)
     last_pos_poll: float = 0.0
     last_fill_poll: float = 0.0
@@ -315,6 +376,11 @@ class LiveQuoter:
     _position_generation: int = -1
     next_safety_poll: dict[str, float] = field(default_factory=dict)
     session: SupervisedSession | None = None
+    _reject_until: dict[tuple[str, str], float] = field(default_factory=dict)
+    _reject_streak: dict[tuple[str, str], int] = field(default_factory=dict)
+    _maxpos_logged: dict[str, bool] = field(default_factory=dict)
+    asset_ctx: dict[str, tuple[float, dict[str, Any]]] = field(default_factory=dict)
+    _block_logged: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.notional:
@@ -429,6 +495,46 @@ class LiveQuoter:
     def on_book(self, coin: str, data: dict[str, Any]) -> None:
         with self._lock:
             self.books[coin] = (time.time(), data)
+
+    def on_asset_ctx(self, coin: str, ctx: dict[str, Any]) -> None:
+        with self._lock:
+            self.asset_ctx[coin] = (time.time(), ctx)
+
+    def entry_block_reason(self, coin: str, top: BookTop) -> str:
+        """按币暂停开仓的原因（不锁死：条件恢复后自动继续）。有仓位时照常减仓。"""
+        if coin in self.settings.rth_only_coins and not is_rth():
+            return "outside NYSE regular hours (RTH_ONLY_COINS)"
+        max_dev = self.settings.oracle_max_dev_bps
+        if max_dev > 0 and top.mid:
+            with self._lock:
+                entry = self.asset_ctx.get(coin)
+            if entry is not None and time.time() - entry[0] <= ORACLE_STALE_S:
+                try:
+                    oracle = float(entry[1].get("oraclePx"))
+                except (TypeError, ValueError):
+                    oracle = 0.0
+                if oracle > 0 and math.isfinite(oracle):
+                    dev = abs(top.mid - oracle) / oracle * 10_000.0
+                    if dev > max_dev:
+                        return f"book mid {top.mid:g} is {dev:.1f} bp from oracle {oracle:g}"
+        return ""
+
+    def _note_block(self, coin: str, reason: str) -> None:
+        if self._block_logged.get(coin, "") == reason:
+            return
+        if reason:
+            log.warning("ENTRY PAUSE %s: %s", coin, reason)
+        else:
+            log.info("ENTRY RESUME %s", coin)
+        self._block_logged[coin] = reason
+
+    def check_session_loss(self) -> None:
+        limit = self.settings.max_session_loss_usd
+        if limit <= 0 or self.diag is None:
+            return
+        pnl = self.diag.run_net_pnl()
+        if pnl <= -limit:
+            self.halt_entries(f"session realized net PnL {pnl:.2f} <= -MAX_SESSION_LOSS_USD {limit:g}")
 
     def peek_book(self, coin: str) -> BookSnap | None:
         """Cache/WS l2Book only. Diagnostics must not open a WS or REST-fallback."""
@@ -584,13 +690,39 @@ class LiveQuoter:
         szi = self.pos.get(coin, 0.0)
         since = self.pos_since.get(coin, 0.0)
         age_ms = int(max(0.0, (now - since) * 1000)) if since and abs(szi) > 0 else 0
+        cap = max_position_usd(self.settings)
+        mid = top.mid or 0.0
+        if abs(szi) > 0 and mid > 0 and abs(szi) * mid >= cap:
+            if not self._maxpos_logged.get(coin):
+                log.warning("position %s $%.2f >= MAX_POSITION_USD $%.2f; skip ALO ladder, IOC now",
+                            coin, abs(szi) * mid, cap)
+                self._maxpos_logged[coin] = True
+            age_ms = max(age_ms, FLAT_TAKE_MS)
+        else:
+            self._maxpos_logged[coin] = False
         return quote_plan(
             self.markets[coin],
             top,
             szi=szi,
             age_ms=age_ms,
             notional_usd=self.notional,
+            take_slippage_ticks=self.settings.take_slippage_ticks,
         )
+
+    def _note_reject(self, coin: str, side: str, *, alo: bool) -> float:
+        key = (coin, side)
+        now = time.time()
+        if alo:
+            wait = ALO_REJECT_RETRY_S
+        else:
+            streak = self._reject_streak.get(key, 0)
+            wait = min(ORDER_REJECT_MAX_S, ORDER_REJECT_BASE_S * (2 ** streak))
+            self._reject_streak[key] = streak + 1
+        self._reject_until[key] = max(self._reject_until.get(key, 0.0), now + wait)
+        return wait
+
+    def _cooling_down(self, coin: str, side: str) -> bool:
+        return time.time() < self._reject_until.get((coin, side), 0.0)
 
     def _post(self, payload: dict[str, Any], *, purpose: str = "maintenance", actions: int = 1) -> Any:
         now = time.time()
@@ -734,19 +866,41 @@ class LiveQuoter:
                 ok = False
         return ok
 
-    def cancel_coin_rests(self, *, refetch: bool = True, only_coin: str | None = None) -> dict[str, Any]:
-        """Cancel cache then refetch frontendOpenOrders dex:io. 429 does not empty cache."""
+    def cancel_coin_rests(
+        self,
+        *,
+        refetch: bool = True,
+        only_coin: str | None = None,
+        sides: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Cancel cache then refetch frontendOpenOrders dex:io. 429 does not empty cache.
+
+        `sides` (with `only_coin`) cancels just those sides plus any extras; the other
+        side keeps resting. None = every side.
+        """
         limited = False
         known = {oid for c in self.markets for oid in list_cached_oids(self.rests, self.extra_oids, c)}
+        canceled: set[int] = set()
         for coin in self.markets:
             if only_coin is not None and coin != only_coin:
                 continue
-            oids = list_cached_oids(self.rests, self.extra_oids, coin)
-            cloids = list_cached_cloids(self.rests, coin)
+            if sides is None:
+                oids = list_cached_oids(self.rests, self.extra_oids, coin)
+                cloids = list_cached_cloids(self.rests, coin)
+            else:
+                picked = [self.rests[coin][s] for s in sides if side_occupied(self.rests, coin, s)]
+                oids = [sl.oid for sl in picked if sl.oid is not None]
+                oids += [o for o in self.extra_oids.get(coin, []) if o not in oids]
+                cloids = [sl.cloid for sl in picked if sl.oid is None and sl.cloid]
+            canceled.update(oids)
             if oids or cloids:
                 try:
                     if self._cancel_pairs(coin, oids, cloids):
-                        clear_coin_rests(self.rests, coin)
+                        if sides is None:
+                            clear_coin_rests(self.rests, coin)
+                        else:
+                            for s in sides:
+                                self.rests[coin][s] = RestSlot()
                         self.extra_oids[coin] = []
                     else:
                         limited = True
@@ -767,8 +921,13 @@ class LiveQuoter:
         opens = [o for o in opens if is_bot_cloid(o.get("cloid")) or o.get("oid") in known]
         self.rests, self.extra_oids = apply_open_orders(self.rests, self.extra_oids, opens, self.markets)
         # 同一轮不再次撤销刚查到的订单；旧快照不能触发重复撤单。
-        limited = limited or any(self._has_rest(c) or self.extra_oids[c]
-                                 for c in self.markets if only_coin is None or c == only_coin)
+        if sides is None:
+            limited = limited or any(self._has_rest(c) or self.extra_oids[c]
+                                     for c in self.markets if only_coin is None or c == only_coin)
+        else:
+            still = {sl.oid for c in self.markets for sl in self.rests[c].values() if sl.oid is not None}
+            limited = limited or bool(canceled & still) or any(
+                self.extra_oids[c] for c in self.markets if only_coin is None or c == only_coin)
         return {"rateLimited": limited, "fetched": True}
 
     def _place(self, coin: str, plan: QuotePlan) -> dict[str, Any] | None:
@@ -807,8 +966,12 @@ class LiveQuoter:
         specs = []
         pending: list[tuple[str, Any]] = []
         for intent in plan.intents:
+            if not plan.take and self._cooling_down(coin, intent.side):
+                log.debug("%s %s in reject cool-down; not placing", coin, intent.side)
+                continue
             if side_occupied(self.rests, coin, intent.side):
-                log.warning("refuse duplicate %s %s; oid/cloid already cached", coin, intent.side)
+                # 这一侧的挂单在容差内被保留；绝不在同一侧再挂第二张。
+                log.debug("keep %s %s rest; not placing a second order on that side", coin, intent.side)
                 continue
             cloid = self.signer.next_cloid(intent.coin, intent.side)  # type: ignore[arg-type]
             specs.append(
@@ -854,9 +1017,12 @@ class LiveQuoter:
                 return {"iocFail": True, "resp": resp}
             if is_alo_reject(resp):
                 log.warning("ALO px rejected, will requote %s", coin)
-                self.last_plan_key[coin] = ""
+                for side, _intent in pending:
+                    self._note_reject(coin, side, alo=True)
                 return {"aloReject": True, "resp": resp}
-            log.warning("order not ok %s %s", coin, resp)
+            for side, _intent in pending:
+                wait = self._note_reject(coin, side, alo=False)
+            log.warning("order not ok %s %s (retry in %.0fs)", coin, resp, wait)
             return {"rejected": True, "resp": resp}
         statuses = resp_statuses(resp)
         if len(statuses) > len(pending):
@@ -876,13 +1042,15 @@ class LiveQuoter:
                 if is_alo_reject(err):
                     alo_rejected = True
                     log.warning("ALO px rejected, will requote %s %s", coin, err)
-                    self.last_plan_key[coin] = ""
+                    self._note_reject(coin, _side, alo=True)
                     continue
                 if plan.take:
                     log.warning("IOC flatten status %s %s", coin, err)
                     continue
-                log.warning("order status %s %s", coin, err)
+                wait = self._note_reject(coin, _side, alo=False)
+                log.warning("order status %s %s %s (retry that side in %.0fs)", coin, _side, err, wait)
                 continue
+            self._reject_streak.pop((coin, _side), None)
             if isinstance(st, dict) and isinstance(st.get("filled"), dict):
                 # IOC 全部/部分成交均不会成为挂单；仓位由新查询确认。
                 self.positions_valid = False
@@ -907,6 +1075,7 @@ class LiveQuoter:
                 tif=intent.tif,
                 reduce_only=intent.reduce_only,
                 placed_at=now,
+                stage=intent.stage,
             )
             self.rests[coin][intent.side] = slot
             accepted += 1
@@ -919,7 +1088,7 @@ class LiveQuoter:
         )
         self._diag_quotes(coin, accepted, take=plan.take)
         return {"resp": resp, "rejected": rejected > 0, "aloReject": alo_rejected,
-                "blocked": self.unknown_write, "planKey": plan.key()}
+                "blocked": self.unknown_write}
 
     def requote(self, coin: str, top: BookTop) -> None:
         plan_started = time.time()
@@ -932,9 +1101,14 @@ class LiveQuoter:
             self.cancel_coin_rests(only_coin=coin)
             return
         plan = self.plan_for(coin, top)
-        if plan.mode == "flat" and not self.entry_allowed():
+        block = self.entry_block_reason(coin, top) if plan.mode == "flat" else ""
+        if plan.mode == "flat":
+            self._note_block(coin, block)
+        if plan.mode == "flat" and (block or not self.entry_allowed()):
             self.next_safety_poll[coin] = time.time() + 5.0
-            self.cancel_coin_rests(only_coin=coin)
+            # 暂停期间可能持续数小时：没有挂单就不必每 5 秒拉一次挂单列表。
+            if not block or self._has_rest(coin) or self.extra_oids.get(coin):
+                self.cancel_coin_rests(only_coin=coin)
             return
         if plan.mode != "flat" and self.entry_halt and not plan.take:
             # 限额期间不消耗稀缺动作重报 ALO，先撤增仓单，15s 后才走原 IOC 阶梯。
@@ -943,17 +1117,8 @@ class LiveQuoter:
             return
         if plan.mode != "flat" and time.time() < self.next_exit_at:
             return
-        key = plan.key()
-        stale = (
-            plan.mode == "flat"
-            and self.quote_placed_at.get(coin, 0) > 0
-            and (time.time() - self.quote_placed_at[coin]) * 1000 > STALE_QUOTE_MS
-        )
         have_buy = side_occupied(self.rests, coin, "B")
         have_sell = side_occupied(self.rests, coin, "A")
-        want_buy = any(i.is_buy for i in plan.intents)
-        want_sell = any(not i.is_buy for i in plan.intents)
-        same_coverage = have_buy == want_buy and have_sell == want_sell
         if plan.take:
             now = time.time()
             if now - self.last_take_at.get(coin, 0.0) < IOC_GAP_S:
@@ -992,17 +1157,61 @@ class LiveQuoter:
                     log.warning("ALO/post-only reject on take path %s: %s", coin, exc)
                 else:
                     log.warning("IOC flatten retry %s: %s", coin, exc)
-            self.last_plan_key[coin] = ""
-            self.quote_placed_at[coin] = 0.0
             self.refresh_positions(force=True)
             self.maybe_deadman()
             return
         if not plan.intents:
             log.warning("no maker plan %s; skip", coin)
-            self.last_plan_key[coin] = ""
             self.maybe_deadman()
             return
-        if same_coverage and key == self.last_plan_key.get(coin) and not stale:
+        # 两侧分开判断：在容差内的挂单不动；类型不对的立即撤；只是价格偏了的按节流替换。
+        now = time.time()
+        tick = top.inferred_tick(self.markets[coin].sz_decimals)
+        desired = {i.side: i for i in plan.intents}
+        urgent: list[str] = []
+        reprice: list[str] = []
+        for side in ("B", "A"):
+            slot = self.rests[coin][side]
+            if not slot.occupied():
+                continue
+            want = desired.get(side)
+            if want is None:
+                urgent.append(side)  # 有仓时的开仓方向：一刻都不留
+                continue
+            verdict = slot_verdict(
+                slot,
+                want,
+                tick=tick,
+                tolerance_ticks=self.settings.requote_tolerance_ticks,
+                stale_quote_s=self.settings.stale_quote_s,
+                now=now,
+            )
+            if verdict == "now":
+                urgent.append(side)
+            elif verdict == "slow" and not self._cooling_down(coin, side):
+                reprice.append(side)  # 冷却中的一侧不改价：旧单留着，好过撤了挂不上
+        missing = [side for side in desired
+                   if not side_occupied(self.rests, coin, side) and not self._cooling_down(coin, side)]
+        elapsed = now - self.last_replace.get(coin, 0.0)
+        throttled = not replace_allowed(
+            take=False,
+            has_rest=have_buy or have_sell,
+            elapsed_s=elapsed,
+            min_replace_s=self.settings.min_replace_s,
+        )
+        # 空仓时、另一侧还挂着、又在节流期内：不补挂也不改价（避免拒单后紧密重报）。
+        defer = throttled and plan.mode == "flat" and not urgent
+        cancel_sides = urgent + ([] if throttled else reprice)
+        will_place = not defer and (bool(missing) or any(s in desired for s in cancel_sides))
+        if not cancel_sides and not will_place:
+            if reprice and throttled and not self._replace_skip_logged.get(coin):
+                log.info(
+                    "min-replace: keep %s rests (%.1fs < MIN_REPLACE_S=%ss); take still allowed",
+                    coin,
+                    elapsed,
+                    self.settings.min_replace_s,
+                )
+                self._replace_skip_logged[coin] = True
             extras = list(self.extra_oids.get(coin, []))
             if extras:
                 try:
@@ -1014,46 +1223,29 @@ class LiveQuoter:
                     log.warning("sweep extras %s: %s", coin, extra_exc)
             self.maybe_deadman()
             return
-        elapsed = time.time() - self.last_replace.get(coin, 0.0)
-        if not replace_allowed(
-            take=False,
-            has_rest=have_buy or have_sell,
-            elapsed_s=elapsed,
-            min_replace_s=self.settings.min_replace_s,
-        ):
-            if not self._replace_skip_logged.get(coin):
-                log.info(
-                    "min-replace: keep %s rests (%.1fs < MIN_REPLACE_S=%ss); "
-                    "mid/far/flat reprice skipped, take still allowed",
-                    coin,
-                    elapsed,
-                    self.settings.min_replace_s,
-                )
-                self._replace_skip_logged[coin] = True
-            self.maybe_deadman()
-            return
-        if stale:
-            log.info("stale same-price rest >45s, cancel+replace %s", coin)
-        else:
-            log.info("plan change, cancel then place %s stage=%s tif=%s", coin, plan.stage, plan.tif)
+        log.info("requote %s stage=%s cancel=%s place=%s", coin, plan.stage, cancel_sides,
+                 sorted(set(missing) | {s for s in cancel_sides if s in desired}))
         try:
-            result = self.cancel_coin_rests(refetch=True, only_coin=coin)
+            # 先撤需要撤的那几侧，再重新拉一次挂单列表核对，才允许下单。
+            result = self.cancel_coin_rests(refetch=True, only_coin=coin, sides=cancel_sides)
         except Exception as exc:  # noqa: BLE001
             if is_alo_reject(exc):
                 log.warning("ALO reject during cancel/replace %s: %s", coin, exc)
-                self.last_plan_key[coin] = ""
                 return
             log.warning("cancel before replace %s: %s", coin, exc)
             return
         if result.get("rateLimited"):
             self.next_safety_poll[coin] = time.time() + 5.0
             return
+        if not will_place:
+            if reprice and not throttled:
+                self._mark_replaced(coin)
+            return
         self.refresh_positions(force=True)
         if not self.position_fresh():
             return
         fresh_plan = self.plan_for(coin, top)
         if fresh_plan.mode != plan.mode or fresh_plan.szi != plan.szi:
-            self.last_plan_key[coin] = ""
             return
         if plan.mode == "flat":
             self.maybe_deadman()
@@ -1072,24 +1264,20 @@ class LiveQuoter:
         except Exception as exc:  # noqa: BLE001
             if is_alo_reject(exc):
                 log.warning("ALO px rejected, will requote %s: %s", coin, exc)
-                self.last_plan_key[coin] = ""
                 self._mark_replaced(coin)
                 return
             log.warning("place failed %s: %s", coin, exc)
             self._mark_replaced(coin)
             return
         if not placed or placed.get("aloReject") or placed.get("rejected") or placed.get("blocked"):
-            self.last_plan_key[coin] = ""
             self._mark_replaced(coin)
             return
-        # _place 可能用新盘口重算过；缓存必须对应实际发出的计划。
-        self.last_plan_key[coin] = placed["planKey"]
-        self.quote_placed_at[coin] = time.time() if plan.mode == "flat" else 0.0
         self._mark_replaced(coin)
         self.maybe_deadman()
 
     def step(self, feed: BookFeed | None) -> None:
         self._feed = feed
+        self.check_session_loss()
         try:
             self.refresh_positions()
         except Exception as exc:  # noqa: BLE001
@@ -1112,7 +1300,6 @@ class LiveQuoter:
             except Exception as exc:  # noqa: BLE001
                 if is_alo_reject(exc):
                     log.warning("ALO px rejected, will requote %s: %s", coin, exc)
-                    self.last_plan_key[coin] = ""
                     continue
                 log.warning("live step %s: %s", coin, exc)
                 self.next_safety_poll[coin] = time.time() + 5.0
@@ -1164,6 +1351,47 @@ def _log_agent(client: InfoClient, signer: LiveSigner) -> None:
             signer.signer_address,
             signer.account,
         )
+
+
+CLOCK_SKEW_WARN_MS = 2_000
+CLOCK_SKEW_MAX_MS = 15_000  # 盘口新鲜度按服务器时间判断；时钟偏太多会一直判成旧盘口
+
+
+def check_signer_role(client: InfoClient, signer: LiveSigner) -> None:
+    """私钥和 HYPERLIQUID_ACCOUNT 对不上时拒绝启动：否则会查 A 账户的仓位、在 B 账户下单。只读。"""
+    data = client.post_info({"type": "userRole", "user": signer.signer_address}, optional=True)
+    role = data.get("role") if isinstance(data, dict) else None
+    if role is None:
+        log.warning("userRole unavailable; cannot verify signer %s -> account %s",
+                    signer.signer_address, signer.account)
+        return
+    if role == "agent":
+        master = str((data.get("data") or {}).get("user") or "")
+        if master and master.lower() != signer.account.lower():
+            raise LiveGuardError(
+                f"preflight: signing key {signer.signer_address} is an agent of {master}, but "
+                f"HYPERLIQUID_ACCOUNT={signer.account}; set HYPERLIQUID_ACCOUNT={master}"
+            )
+        return
+    if signer.is_agent:
+        raise LiveGuardError(
+            f"preflight: key {signer.signer_address} is not an approved agent of {signer.account} "
+            f"(userRole={role!r}); orders would hit the key's own account"
+        )
+
+
+def check_clock(client: InfoClient, coin: str) -> None:
+    """只读：本机时钟和交易所时间对比。"""
+    try:
+        server_ms = int(client.l2_book(coin).get("time"))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("clock check skipped: %s", exc)
+        return
+    skew = int(time.time() * 1000) - server_ms
+    if abs(skew) > CLOCK_SKEW_MAX_MS:
+        raise LiveGuardError(f"preflight: local clock is {skew / 1000:+.1f}s off Hyperliquid; fix NTP first")
+    if abs(skew) > CLOCK_SKEW_WARN_MS:
+        log.warning("local clock is %+.1fs off Hyperliquid; check NTP", skew / 1000)
 
 
 def _run_supervised(quoter: LiveQuoter, feed: BookFeed, stop: dict[str, Any]) -> int:
@@ -1268,10 +1496,12 @@ def run_live(settings: Settings, *, seconds: float | None = None,
         log.info(
             "fill-diag observe-only: FILL_DIAG jsonl per fill (+3s markout) and "
             "quote/fill counters split io:ANTH vs io:SNDK. SNDK session=rth|ah "
-            "(Mon–Fri 09:30–16:00 America/New_York; no holiday calendar). "
+            "(NYSE regular hours incl. holidays / early closes, entropy_bot/market_hours.py). "
             "AH markout stays in its own bucket."
         )
         _log_agent(client, signer)
+        check_signer_role(client, signer)
+        check_clock(client, settings.coins[0])
         quoter = LiveQuoter(settings, markets, client, signer)
         quoter.session = session
         quoter.preflight()
@@ -1299,6 +1529,7 @@ def run_live(settings: Settings, *, seconds: float | None = None,
             quoter.on_book,
             user=signer.account,
             on_user_fills=quoter.on_user_fills,
+            on_asset_ctx=quoter.on_asset_ctx,
         )
         quoter._feed = feed
         feed.start()

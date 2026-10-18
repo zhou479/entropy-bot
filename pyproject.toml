@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "entropy-bot"
-version = "0.2.0"
+version = "0.3.0"
 description = "Official Hyperliquid HTTP+WS HIP-3 bot for EntropyIO (io:ANTH, io:SNDK)"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0.0"]
+dev = ["pytest>=8.0.0", "ruff>=0.6.0"]
 
 [project.scripts]
 entropy-bot = "entropy_bot.cli:main"
@@ -32,3 +32,11 @@ include = ["entropy_bot*"]
 testpaths = ["tests"]
 addopts = "-q"
 pythonpath = ["."]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+# 只查会导致错误的问题（pyflakes + 语法），不强制代码风格。
+select = ["E9", "F"]

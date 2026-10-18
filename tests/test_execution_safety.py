@@ -3,7 +3,7 @@
 import pytest
 import requests
 
-from entropy_bot.errors import ExchangeOutcomeUnknown, LiveGuardError, RequestWeightLimited
+from entropy_bot.errors import ExchangeOutcomeUnknown, LiveGuardError
 from entropy_bot.live import RestSlot, positions_from_state
 from entropy_bot.rest import InfoClient
 from entropy_bot.safety import RequestBudget, cancel_confirmed

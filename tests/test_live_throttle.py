@@ -129,6 +129,9 @@ class FakeClient:
     def extra_agents(self, *args: object, **kwargs: object) -> list:
         return []
 
+    def post_info(self, payload: dict[str, Any], **kwargs: object) -> Any:
+        return None  # userRole 等只读查询：模拟"查不到"，只告警不拦截
+
 
 def _book_data(bid: str, ask: str) -> dict[str, Any]:
     return {"levels": [[{"px": bid, "sz": "1", "n": 1}], [{"px": ask, "sz": "1", "n": 1}]]}

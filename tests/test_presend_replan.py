@@ -57,7 +57,7 @@ def test_maker_uses_book_after_cancel_and_caches_actual_plan(setup, monkeypatch)
     q.requote(COIN, _top("1764", "1764.1", COIN))
     specs = _order_posts(client)[0]["action"]["orders"]
     assert [s[2] for s in specs] == [1763, 1763.1]
-    assert q.last_plan_key[COIN] == q.plan_for(COIN, _top("1763", "1763.1", COIN)).key()
+    assert (q.rests[COIN]["B"].px, q.rests[COIN]["A"].px) == (1763, 1763.1), "缓存对应实际发出的价格"
 
 
 @pytest.mark.parametrize("size,price", [(0.02, 1763), (-0.02, 1763.1)])
@@ -78,7 +78,6 @@ def test_crossing_take_threshold_defers_old_alo_then_takes(setup, monkeypatch, s
     change_book_during_cancel(clock, q, monkeypatch)
     q.requote(COIN, _top("1764", "1764.1", COIN))
     assert not _order_posts(client), "跨过 15 秒不能继续发旧 ALO"
-    assert q.last_plan_key[COIN] == ""
     clock.advance(0.4)
     q.requote(COIN, _top("1763", "1763.1", COIN))
     assert _order_posts(client)[0]["action"]["orders"][0][-2:] == (True, "Ioc")
@@ -93,7 +92,7 @@ def test_crossing_far_to_mid_uses_new_stage(setup, monkeypatch):
     expected = q.plan_for(COIN, _top("1763", "1763.1", COIN))
     assert expected.stage == "mid"
     assert actual[2] == expected.intents[0].px
-    assert q.last_plan_key[COIN] == expected.key()
+    assert q.rests[COIN]["A"].stage == "mid", "缓存记录的是实际发出的阶段"
 
 
 def test_book_refresh_is_after_budget_query_without_extra_rest(setup, monkeypatch):
@@ -163,7 +162,6 @@ def test_partial_rejection_preserves_success_and_invalidates_plan(setup):
     q.requote(COIN, _top("1764", "1764.1", COIN))
     assert q.rests[COIN]["A"].oid == 999
     assert not q.rests[COIN]["B"].occupied()
-    assert q.last_plan_key[COIN] == ""
     posts = len(client.posts)
     clock.advance(1)
     q.requote(COIN, _top("1764", "1764.1", COIN))
@@ -182,5 +180,4 @@ def test_general_rejection_does_not_cache_successful_plan(setup):
     _, client, q = setup
     client.exchange_error = response([{"error": "Insufficient margin"}] * 2)
     q.requote(COIN, _top("1764", "1764.1", COIN))
-    assert q.last_plan_key[COIN] == ""
     assert not q._has_rest(COIN)

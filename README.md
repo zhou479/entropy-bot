@@ -3,6 +3,7 @@
 每天人工运行 2～3 小时的部署与修复说明见 [DEPLOY_SUPERVISED.md](DEPLOY_SUPERVISED.md)。
 新增显式 `live --supervised-no-deadman --seconds 7200` 模式，不申请不可用的自动撤单保护；到时关闭新开仓并尝试有界减仓。服务器故障仍可能留仓，不能无人值守。推荐使用文档中的启动脚本（每次确认、日志、同机互斥）。
 原执行安全修复的历史审查见 [SAFETY_REVIEW.md](SAFETY_REVIEW.md)；离线测试通过不等于实盘或收益验证。
+`paper` 现在跑的就是实盘的值守会话流程（只把交易所换成本地模拟撮合，不签名）；`flatten` 是收尾失败时的紧急平仓命令。
 
 **This Python package is the real bot.** It talks only to official Hyperliquid HTTP + WebSocket. The Chrome Tampermonkey userscript (`entropy-desk.user.js`) is optional / legacy — do not depend on it for live MM.
 
@@ -31,7 +32,7 @@ Per coin: at most **1 buy + 1 sell**. Isolated-only. Builder = Entropy `0xcD254d
 
 - Spread ≤ 2 ticks: join exact bid/ask.
 - Spread > 2 ticks: `buy=floorToTick(mid-tick)`, `sell=ceilToTick(mid+tick)`, clamp inside the book, `buy < sell`. Example `1985.00 / 1986.90 / tick 0.1` → buy **1985.8** sell **1986.1**.
-- Same-price rests older than 45s: cancel and replace at fresh BBO/mid.
+- Each side is managed on its own. A rest within `REQUOTE_TOLERANCE_TICKS` (default 1) of its target stays put (no write, queue priority kept); only the side that moved is canceled and re-placed. An untouched flat rest is refreshed after `STALE_QUOTE_S` (default 120s; was a fixed 45s).
 
 **IN POSITION** — flatten only, never add. Size `min(notionalSz, |szi|)`. Age clock starts when `|szi|` first becomes nonzero; resets on flat.
 
@@ -40,7 +41,20 @@ Per coin: at most **1 buy + 1 sell**. Isolated-only. Builder = Entropy `0xcD254d
 - `6–15s`: reduce-only ALO improved to mid (or 1 tick inside the near touch).
 - `≥15s`: cancel rests, reduce-only **IOC** take on the near touch (long sell@bid, short buy@ask).
 
-ALO / Bad Alo Px / post-only reject: log and requote; the loop does not stop. Stage / TIF / price change: cancel that coin's rests (local cache + `frontendOpenOrders` with `dex:"io"`) then place — **throttled** by `MIN_REPLACE_S` (default 12s) per coin while a rest is live. A book tick alone does not cancel+replace until that interval passes. Flatten ≥15s IOC take still fires on schedule and is not serialized behind the same interval. Never place a side that already has an oid/cloid. HIP-3 oids exceed int32 — they are never truncated.
+- `|position| × mid ≥ MAX_POSITION_USD` (default 3 × notional) skips the ALO ladder: IOC now. `TAKE_SLIPPAGE_TICKS` (default 0 = unchanged) lets the IOC cross a few ticks past the touch.
+
+ALO reject: that side waits 2s. Any other per-order reject (margin, builder, size) backs that side off 2s → 4s → … 60s instead of retrying every loop. A **price-only** change is throttled by `MIN_REPLACE_S` (default 12s) per coin while a rest is live. A rest of the **wrong kind** — the opening side once a fill turns flat into a position, or a far/mid stage change — is replaced at once: the bot never leaves an opening order up while in a position. Every placement re-reads `frontendOpenOrders` (`dex:"io"`) first. Order sizes round up one lot when flooring would land under the exchange's $10 minimum. Never place a side that already has an oid/cloid. HIP-3 oids exceed int32 — they are never truncated.
+
+### Entry pauses and limits
+
+Opening (flat) quotes are canceled and not placed while any of these hold; an open position is still flattened. They are **not** latched: quoting resumes when the condition clears.
+
+- `ORACLE_MAX_DEV_BPS` (default 50): book mid more than N bp from `oraclePx` (read-only WS `activeAssetCtx`; ignored if older than 30s).
+- `RTH_ONLY_COINS` (default empty = no time filter), e.g. `io:SNDK`: outside NYSE regular hours. Static holiday / 13:00 early-close calendar in `entropy_bot/market_hours.py`; extend it yearly.
+
+`MAX_SESSION_LOSS_USD` (default 0 = off): once this run's realized `closedPnl − fee` is below −N, entries latch off like any other safety stop; in supervised mode the session drains and exits non-zero. Unrealized PnL is not counted.
+
+Startup also refuses a signing key whose `userRole` does not match `HYPERLIQUID_ACCOUNT`, and a local clock more than 15s off Hyperliquid (book freshness is judged by server time).
 
 ### Request weight / write throttle
 
@@ -59,7 +73,8 @@ Per fill (after 3s, using the already-subscribed `l2Book`; no extra WS):
 - `coin` (`io:ANTH` / `io:SNDK`), `side` (buy/sell), `fill_px`, `mid_at_fill`, `mid_3s`
 - `markout_bps`: buy `(mid_3s - fill_px)/fill_px * 1e4`; sell `(fill_px - mid_3s)/fill_px * 1e4`. If the book is stale >15s at +3s, `mid_3s` is null and markout is skipped.
 - `spread` (ask−bid) and `spread_bps` vs mid at fill time
-- counters on the same row: `quotes`, `fills`, `fill_rate` (`fills/quotes`, null if no quotes)
+- `crossed` (taker), `fee`, `closed_pnl`, `day_net_pnl` from the fill
+- counters on the same row: `quotes`, `fills`, `fill_rate` (`fills/quotes`, null if no quotes), `taker_fills`. `fills` counts distinct maker orders, so a partially filled quote counts once and `fill_rate ≤ 1`; IOC exits are `taker_fills`.
 
 ANTH and SNDK never share a bucket. SNDK rows also have `session=rth` or `session=ah`. Regular hours are Mon–Fri 09:30–16:00 `America/New_York`. **No holiday calendar** — a weekday cash holiday is still tagged `rth`. After-hours markout is dirty: it is logged and kept in the AH bucket only; it is never folded into an RTH average.
 
@@ -115,13 +130,17 @@ pip install -e ".[dev]"   # optional, for pytest
 cp .env.example .env      # edit locally; never commit secrets
 
 python -m entropy_bot status          # public API, no key
-python -m entropy_bot paper           # WS quotes, paper fills, no signing
-python -m entropy_bot paper --seconds 15
+python -m entropy_bot paper --seconds 600   # the live supervised loop vs a simulated exchange; never signs
 python -m entropy_bot live            # refuses unless LIVE=1 and a key
-python -m entropy_bot cancel          # cancel this bot's cloIDs (needs key)
+python -m entropy_bot cancel          # cancel this bot's cloIDs (needs key) — does NOT close positions
+python -m entropy_bot flatten         # emergency: cancel bot orders + reduce-only IOC ANTH/SNDK flat (needs key)
 ```
 
-`status` prints io meta, books, Entropy Partner T4, self rebate, growth mode, and default TIF — no key required.
+`status` prints io meta, books, Entropy Partner T4, self rebate, growth mode, and default TIF — no key required. With `HYPERLIQUID_ACCOUNT` it also prints the address request budget.
+
+`paper` ends with `PAPER SUMMARY` (maker/taker fills, volume, realized PnL, number of signed actions it would have cost). Its fill model is simple — a rest fills when the live touch trades through it — so treat fill rates as optimistic.
+
+`flatten` asks you to type `FLATTEN` (or `--yes`), refuses while `scripts/run-supervised.sh` holds the run lock, never touches orders the bot did not place, and exits 0 only when the exchange reports no position and no bot orders.
 
 ### VPS
 
@@ -158,7 +177,14 @@ Only an accepted and still-active `scheduleCancel` can cancel resting orders aft
 | `HYPERLIQUID_PRIVATE_KEY` | unset | Agent or master key. Required for `live` / `cancel`. Never commit |
 | `HYPERLIQUID_ACCOUNT` | derived from key | Master address. Set this when the key is an agent |
 | `COINS` | `io:ANTH,io:SNDK` | Case-sensitive; foreign venues rejected. Changing markets does not reset account limits |
-| `MIN_REPLACE_S` | `12` | Per-coin seconds between cancel+replace while a rest is live. Flatten ≥15s IOC take is not gated |
+| `MIN_REPLACE_S` | `12` | Per-coin seconds between price-only reprices while a rest is live. Wrong-kind rests and the ≥15s IOC are not gated |
+| `REQUOTE_TOLERANCE_TICKS` | `1` | Keep a rest within N ticks of its target. `0` = reprice on any move |
+| `STALE_QUOTE_S` | `120` | Refresh an untouched flat rest after N s. `0` = off |
+| `TAKE_SLIPPAGE_TICKS` | `0` | Flatten IOC crosses N ticks past the touch |
+| `MAX_POSITION_USD` | 3 × notional | Position notional that skips the ALO ladder |
+| `ORACLE_MAX_DEV_BPS` | `50` | Pause opening quotes while mid is N bp from oracle. `0` = off |
+| `RTH_ONLY_COINS` | empty | Coins that only open quotes in NYSE regular hours |
+| `MAX_SESSION_LOSS_USD` | `0` | Stop entries (and drain the session) below −N realized net PnL. `0` = off |
 | `QUOTE_NOTIONAL_USD` | `50` | Notional per side (live and paper), ≥ $10 |
 | `QUOTE_OFFSET_TICKS` | `2` | Legacy. Live ignores it |
 | `MAX_LEVERAGE` | `2` | Capped below each market max (ANTH 3 / SNDK 10) |
@@ -169,14 +195,16 @@ Only an accepted and still-active `scheduleCancel` can cancel resting orders aft
 | `ENTROPY_REFERRED_USER_BENEFIT` | `0` | Optional extra on own fills. Default off |
 | `REFERRAL_DISCOUNT` | `0` | Optional HL-side gross taker multiplier |
 | `MAKER_REBATE_BPS` | unset | Optional HL ALO maker-share rebate in bp |
-| `HYPERLIQUID_API_URL` | official mainnet | Official host required |
-| `HYPERLIQUID_WS_URL` | official mainnet | Official host required |
+| `HYPERLIQUID_API_URL` | official mainnet | `https://` on `*.hyperliquid.xyz` (hostname checked) |
+| `HYPERLIQUID_WS_URL` | official mainnet | `wss://` on `*.hyperliquid.xyz` (hostname checked) |
 
 Markets are **isolated-only**. Live sets isolated leverage per coin and never uses cross. Default TIF is ALO for two-sided quotes; flatten ≥15s may IOC take.
 
 ### Tests
 
 ```bash
+pip install -c constraints-tested.txt -e ".[dev]"
+ruff check entropy_bot tests
 pytest
 ```
 
@@ -199,13 +227,17 @@ DEX 名是 **`io`**。不要用 `xyz` 或 `vntl`。
 
 ### 实盘策略（从 userscript 1.6.1 移植）
 
-每币最多 1 买 + 1 卖。空仓双边 ALO：价差 ≤2 tick 贴买卖一；价差 >2 tick 往中间贴（例 1985.00/1986.90/tick 0.1 → 买 1985.8 卖 1986.1）。有仓只减仓：`<6s` 远档 ALO，`6–15s` 中间 ALO，`≥15s` 撤后 IOC 吃单。空仓同价挂 45s 无成交则重挂。ALO 被拒不停止。Builder 是 Entropy、费率 0。挂单还在时，盘口跳动不会立刻撤换；每币至少隔 `MIN_REPLACE_S`（默认 12 秒）才 cancel+replace。≥15s 的 IOC 吃单仍按点触发，不受这 12 秒卡住。
+每币最多 1 买 + 1 卖。空仓双边 ALO：价差 ≤2 tick 贴买卖一；价差 >2 tick 往中间贴（例 1985.00/1986.90/tick 0.1 → 买 1985.8 卖 1986.1）。有仓只减仓：`<6s` 远档 ALO，`6–15s` 中间 ALO，`≥15s` 撤后 IOC 吃单；仓位名义超过 `MAX_POSITION_USD`（默认 3 倍单边金额）直接 IOC。Builder 是 Entropy、费率 0。
+
+两侧分开管理：挂单离目标价不超过 `REQUOTE_TOLERANCE_TICKS`（默认 1 tick）就不动（不花写请求、保留排队位置），只撤换变动的那一侧；空仓挂单 `STALE_QUOTE_S`（默认 120 秒，原来固定 45 秒）没动才刷新。纯价格变动每币至少隔 `MIN_REPLACE_S`（默认 12 秒）才换；**类型不对的挂单立即换**——成交后空仓变有仓时，开仓方向的单马上撤掉，绝不在有仓时留着开仓单；远档→中间价的阶段切换也不等 12 秒。ALO 被拒那一侧等 2 秒；其它拒单（保证金不足、builder 未授权等）那一侧按 2s → 4s → … 最长 60s 退避，不再每轮重试。下单数量保证 ≥ $10。每次下单前仍会先重新拉一次挂单列表核对。
+
+开仓暂停（不锁死，条件恢复后自动继续；有仓照常平）：`ORACLE_MAX_DEV_BPS`（默认 50bp，盘口 mid 偏离 oracle 过大）；`RTH_ONLY_COINS`（默认空 = 不限时段；设成 `io:SNDK` 则只在纽约正常交易时段开仓，NYSE 节假日日历在 `entropy_bot/market_hours.py`）。`MAX_SESSION_LOSS_USD`（默认 0 关闭）：本次运行已实现净亏损达到 N 美元就锁定开仓，值守模式下进入收尾并非零退出。启动时还会检查私钥的 `userRole` 是否和 `HYPERLIQUID_ACCOUNT` 对得上、本机时钟是否偏差超过 15 秒。
 
 累计请求限额不会因等待或切换币种恢复。启动前查询额度、仓位和挂单；未知状态、非空账户或额度不足时拒绝启动。运行中命中累计限额会锁定禁止开仓，撤单与 reduce-only 退出单走独立节流路径。普通退出重试间隔至少 3 秒，限额后的退出重试至少 11 秒。不会购买额度或为解锁额度额外交易。价格/仓位算法保持原样，异常调度不保证按 15 秒成交。REST 成交补漏改为每 30 秒，WS 逐笔诊断保持。
 
 Tick 从盘口买卖价增量推断，不用 `tick_size(mid)`。
 
-实盘只多打 `FILL_DIAG` JSON 行：成交价、成交时 mid、+3s mid、方向化 markout（买后 mid 涨为正）、价差、以及按币分开的报价次数 / 成交次数 / fill rate。SNDK 带 `session=rth|ah`（纽约时间周一至周五 09:30–16:00 为 rth，**不含节假日日历**）。AH markout 单独桶，不并进 RTH。不改报价、撤单、仓位阶梯。
+实盘只多打 `FILL_DIAG` JSON 行：成交价、成交时 mid、+3s mid、方向化 markout（买后 mid 涨为正）、价差、`crossed`（是否吃单）、`fee`、`closed_pnl`、当日净盈亏 `day_net_pnl`，以及按币分开的报价次数 / 成交次数（同一挂单多次部分成交只算一次）/ fill rate / taker 成交数。SNDK 带 `session=rth|ah`（按 NYSE 日历，含节假日和提前收盘）。AH markout 单独桶，不并进 RTH。
 
 ### 签名 / agent
 
@@ -219,9 +251,10 @@ Dead-man 是账户级撤单定时器，不会平仓。默认严格模式只有�
 
 ```bash
 python -m entropy_bot status   # 公共行情，不需要私钥
-python -m entropy_bot paper    # 纸面报价，不签名
+python -m entropy_bot paper --seconds 600   # 实盘值守流程 + 本地模拟撮合；不签名，结束打印 PAPER SUMMARY
 python -m entropy_bot live     # 实盘；缺 LIVE=1 或私钥会直接拒绝
-python -m entropy_bot cancel   # 撤销本机器人的 cloid
+python -m entropy_bot cancel   # 撤销本机器人的 cloid（不平仓）
+python -m entropy_bot flatten  # 紧急平仓：撤本机器人挂单 + reduce-only IOC 平掉 ANTH/SNDK；需输入 FLATTEN
 ```
 
 VPS 人工限时运行请按 [DEPLOY_SUPERVISED.md](DEPLOY_SUPERVISED.md) 配置 agent、tmux 和启动脚本。不要配置自动重启。只有交易所已经接受且尚有效的 dead-man 才能在进程失联后撤单，人工值守模式没有该保护。

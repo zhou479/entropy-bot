@@ -11,6 +11,9 @@ from decimal import Decimal, ROUND_CEILING, ROUND_DOWN
 
 MAX_DECIMALS_PERP = 6
 SIG_FIGS = 5
+# 交易所拒绝 $10 以下的订单（"Order must have minimum value of $10"），
+# 唯一例外是刚好平掉整个仓位的 reduce-only 单。
+MIN_NOTIONAL_USD = 10.0
 
 
 def max_price_decimals(sz_decimals: int) -> int:
@@ -68,6 +71,22 @@ def size_from_notional(notional_usd: float, price: float, sz_decimals: int) -> f
     if price <= 0:
         raise ValueError("price must be positive")
     return floor_size(notional_usd / price, sz_decimals)
+
+
+def order_size(notional_usd: float, price: float, sz_decimals: int) -> float:
+    """约 `notional_usd` 的下单数量，但在 `price` 处不低于 $10 下限。
+
+    $10 / price 向下取整会略低于 $10（例如 0.0077 @ 1293.8 = $9.96），交易所每次都拒。
+    这种情况进一个最小单位；正常金额（如 $50）仍向下取整，结果不变。
+    """
+    if price <= 0:
+        raise ValueError("price must be positive")
+    sz = floor_size(notional_usd / price, sz_decimals)
+    if sz * price < MIN_NOTIONAL_USD - 1e-9:
+        quant = Decimal(10) ** -int(sz_decimals)
+        need = (Decimal(str(MIN_NOTIONAL_USD)) / Decimal(str(price))).quantize(quant, rounding=ROUND_CEILING)
+        sz = float(need)
+    return sz
 
 
 def spread_bps(bid: float, ask: float) -> float | None:

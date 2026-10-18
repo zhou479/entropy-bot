@@ -4,13 +4,9 @@ from entropy_bot.precision import book_tick, tick_from_wire
 from entropy_bot.quoting import (
     FLAT_FAR_MS,
     FLAT_TAKE_MS,
-    PaperState,
-    QuoteIntent,
     book_top,
     desired_quotes,
-    detect_paper_fills,
     flatten_stage,
-    install_quotes,
     quote_plan,
     sync_pos_since,
 )
@@ -23,22 +19,6 @@ def _book(coin: str, bid: str, ask: str) -> dict:
             [{"px": ask, "sz": "1", "n": 1}],
         ]
     }
-
-
-def test_paper_fill_when_ask_crosses_bid(markets):
-    state = PaperState()
-    install_quotes(
-        state,
-        [
-            QuoteIntent("io:ANTH", 200_001, True, 1979.0, 0.02, "B"),
-            QuoteIntent("io:ANTH", 200_001, False, 1981.0, 0.02, "A"),
-        ],
-    )
-    top = book_top("io:ANTH", _book("io:ANTH", "1981.2", "1981.5"))
-    fills = detect_paper_fills(state, top)
-    assert len(fills) == 1
-    assert fills[0].side == "A"
-    assert state.position["io:ANTH"] == -0.02
 
 
 def test_desired_quotes_stay_post_only(markets):
