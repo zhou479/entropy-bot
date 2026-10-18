@@ -18,6 +18,10 @@ class RateLimited(EntropyBotError):
     """Official API returned 429 or an empty rate-limit body."""
 
 
+class ExchangeOutcomeUnknown(EntropyBotError):
+    """写入可能已到交易所，不能把网络异常当成拒单并盲目重发。"""
+
+
 class RequestWeightLimited(RateLimited):
     """Address-level cumulative request weight exhausted.
 

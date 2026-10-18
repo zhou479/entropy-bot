@@ -9,7 +9,8 @@ from typing import Any
 import requests
 
 from entropy_bot.coins import ALLOWED_DEX, assert_no_foreign_venue, assert_tradable
-from entropy_bot.errors import RateLimited, RequestWeightLimited, error_text, is_weight_limit_error
+from entropy_bot.errors import (ExchangeOutcomeUnknown, RateLimited, RequestWeightLimited,
+                                error_text, is_weight_limit_error)
 
 log = logging.getLogger("entropy_bot.rest")
 
@@ -25,6 +26,7 @@ class InfoClient:
         self._perp_dexs: list[Any] | None = None
         self._meta: dict[str, Any] | None = None
         self._meta_and_ctxs: Any | None = None
+        self._info_backoff_until = 0.0
 
     def close(self) -> None:
         self.session.close()
@@ -37,6 +39,10 @@ class InfoClient:
         optional: bool = False,
     ) -> Any:
         assert_no_foreign_venue(payload)
+        if time.monotonic() < self._info_backoff_until:
+            if optional:
+                return None
+            raise RateLimited("info local cooldown after 429")
         url = f"{self.base_url}/info"
         try:
             response = self.session.post(url, json=payload, timeout=self.timeout)
@@ -46,6 +52,7 @@ class InfoClient:
                 return None
             raise
         if response.status_code == 429:
+            self._info_backoff_until = time.monotonic() + 5.0
             if optional:
                 log.warning("info 429 for %s", payload.get("type"))
                 return None
@@ -144,13 +151,16 @@ class InfoClient:
             return None
         return data if isinstance(data, list) else None
 
+    def user_rate_limit(self, user: str) -> Any:
+        return self.post_info({"type": "userRateLimit", "user": user}, optional=True)
+
     def post_exchange(self, payload: dict[str, Any]) -> Any:
         assert_no_foreign_venue(payload)
         url = f"{self.base_url}/exchange"
         try:
             response = self.session.post(url, json=payload, timeout=self.timeout)
         except requests.RequestException as exc:
-            raise RateLimited(f"exchange request failed: {exc}") from exc
+            raise ExchangeOutcomeUnknown("exchange transport failed; reconcile before retry") from exc
         if response.status_code == 429:
             text = response.text or "exchange 429"
             if is_weight_limit_error(text):
@@ -158,10 +168,16 @@ class InfoClient:
             raise RateLimited("exchange 429")
         if not response.ok and is_weight_limit_error(response.text):
             raise RequestWeightLimited(response.text)
-        response.raise_for_status()
+        if not response.ok:
+            raise ExchangeOutcomeUnknown(f"exchange HTTP {response.status_code}; outcome unknown")
         if not response.content or response.content.strip() in {b"", b"null"}:
-            return None
-        data = response.json()
-        if is_weight_limit_error(data):
+            raise ExchangeOutcomeUnknown("exchange empty response; outcome unknown")
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise ExchangeOutcomeUnknown("exchange invalid JSON; outcome unknown") from exc
+        if not isinstance(data, dict) or data.get("status") not in ("ok", "err"):
+            raise ExchangeOutcomeUnknown("exchange unexpected response schema")
+        if data.get("status") == "err" and is_weight_limit_error(data):
             raise RequestWeightLimited(error_text(data))
         return data

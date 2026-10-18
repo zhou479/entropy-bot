@@ -369,14 +369,16 @@ def blob_text(value: Any) -> str:
 
 
 def is_alo_reject(err: Any) -> bool:
-    text = blob_text(err)
+    # 交易所实测文案是 "Post only ... would have immediately matched"。
+    # 统一大小写、连字符及空白，但不把普通余额/签名错误当作可重报拒单。
+    text = " ".join(blob_text(err).lower().replace("-", " ").split())
     return bool(
         text
         and (
-            "Bad Alo Px" in text
-            or "alo px" in text.lower()
-            or "post-only" in text.lower()
-            or "would match immediately" in text.lower()
+            "alo px" in text
+            or "post only" in text
+            or "would match immediately" in text
+            or "would have immediately matched" in text
         )
     )
 

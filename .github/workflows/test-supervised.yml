@@ -1,0 +1,24 @@
+name: Offline safety tests
+on:
+  push:
+    branches: [fix/supervised-sessions]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -c constraints-tested.txt -e '.[dev]'
+      - run: python -m pip check
+      - run: bash -n scripts/run-supervised.sh
+      - run: python -m pytest -p no:cacheprovider
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
