@@ -24,8 +24,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=__version__)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status", help="Print io meta + books. No key required.")
-    paper = sub.add_parser("paper", help="Shadow-quote ALO on one WS. Never signs.")
-    paper.add_argument("--seconds", type=float, default=None, help="Stop after N seconds")
+    paper = sub.add_parser(
+        "paper",
+        help="Run the live supervised loop against a simulated exchange. Never signs or sends orders.",
+    )
+    paper.add_argument("--seconds", type=float, default=None, help="Session length (default 600, max 10800)")
     live = sub.add_parser(
         "live",
         help="Official HTTP+WS live MM (ALO + flatten ladder). Requires LIVE=1 and a key.",
@@ -36,7 +39,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Explicitly run without exchange-side auto-cancel; requires --seconds <=10800. "
              "Stops entries before the deadline, then attempts bounded reduce-only cleanup.",
     )
-    sub.add_parser("cancel", help="Cancel resting bot cloIDs on ANTH/SNDK.")
+    sub.add_parser("cancel", help="Cancel resting bot cloIDs on ANTH/SNDK (does NOT close positions).")
+    flatten = sub.add_parser(
+        "flatten",
+        help="Emergency: cancel bot orders and reduce-only IOC every ANTH/SNDK position flat, then verify.",
+    )
+    flatten.add_argument("--yes", action="store_true", help="Skip the FLATTEN confirmation prompt")
     return parser
 
 
@@ -65,6 +73,10 @@ def main(argv: list[str] | None = None) -> int:
             from entropy_bot.cancel import run_cancel
 
             return run_cancel(settings)
+        if args.command == "flatten":
+            from entropy_bot.flatten import run_flatten
+
+            return run_flatten(settings, assume_yes=args.yes)
         parser.error(f"unknown command {args.command}")
         return 2
     except EntropyBotError as exc:
