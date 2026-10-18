@@ -8,8 +8,9 @@ Asset IDs follow the official Hyperliquid formula:
 (looked up every run; `io` is currently 10). `index_in_meta` is the
 index of the coin in `meta` with `{"type":"meta","dex":"io"}`.
 
-Coin names are case-sensitive. Foreign venues (`xyz:`, `vntl:`) and
-delisted `io` listings are refused.
+Coin names are case-sensitive. Foreign venues (`xyz:`, `vntl:`), the
+`io` listings this bot does not trade (`DELISTED_COINS`), and anything the
+live meta marks `isDelisted` are refused.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from entropy_bot.errors import CoinError
 ALLOWED_DEX = "io"
 ALLOWED_COINS: tuple[str, ...] = ("io:ANTH", "io:SNDK")
 FORBIDDEN_VENUES: tuple[str, ...] = ("xyz", "vntl")
+# Not traded by this bot. (Historically delisted; check live meta before adding back.)
 DELISTED_COINS: tuple[str, ...] = ("io:OAI", "io:IONQ")
 FOREIGN_EXAMPLES: tuple[str, ...] = ("xyz:SNDK", "vntl:ANTHROPIC")
 
