@@ -51,6 +51,7 @@ def format_status(
     books: dict[str, Any],
     user_state: dict[str, Any] | None = None,
     settings: Settings | None = None,
+    rate_limit: dict[str, Any] | None = None,
 ) -> str:
     lines = [
         f"DEX {dex_info.get('name')} ({dex_info.get('fullName')})  "
@@ -89,6 +90,16 @@ def format_status(
         pos_lines = isolated_positions(user_state, tuple(markets))
         lines.append("user isolated state (io):")
         lines.extend(pos_lines or ["  no isolated positions on ANTH/SNDK"])
+    if isinstance(rate_limit, dict):
+        try:
+            headroom = (int(rate_limit["nRequestsCap"]) - int(rate_limit["nRequestsUsed"])
+                        + int(rate_limit.get("nRequestsSurplus") or 0))
+        except (KeyError, TypeError, ValueError):
+            headroom = None
+        lines.append(
+            f"request budget: used={rate_limit.get('nRequestsUsed')} cap={rate_limit.get('nRequestsCap')} "
+            f"surplus={rate_limit.get('nRequestsSurplus')} available={headroom} cumVlm={rate_limit.get('cumVlm')}"
+        )
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -99,9 +110,11 @@ def run_status(settings: Settings) -> int:
         dex = perp_dex_info(client.perp_dexs(), ALLOWED_DEX)
         books = {coin: client.l2_book(coin) for coin in settings.coins}
         user_state = None
+        rate_limit = None
         if settings.account:
             user_state = client.clearinghouse_state(settings.account, ALLOWED_DEX)
-        print(format_status(dex, markets, ctxs, books, user_state, settings))
+            rate_limit = client.user_rate_limit(settings.account)
+        print(format_status(dex, markets, ctxs, books, user_state, settings, rate_limit))
         return 0
     finally:
         client.close()

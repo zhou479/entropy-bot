@@ -1368,6 +1368,47 @@ def _log_agent(client: InfoClient, signer: LiveSigner) -> None:
         )
 
 
+CLOCK_SKEW_WARN_MS = 2_000
+CLOCK_SKEW_MAX_MS = 15_000  # 盘口新鲜度按服务器时间判断；时钟偏太多会一直判成旧盘口
+
+
+def check_signer_role(client: InfoClient, signer: LiveSigner) -> None:
+    """私钥和 HYPERLIQUID_ACCOUNT 对不上时拒绝启动：否则会查 A 账户的仓位、在 B 账户下单。只读。"""
+    data = client.post_info({"type": "userRole", "user": signer.signer_address}, optional=True)
+    role = data.get("role") if isinstance(data, dict) else None
+    if role is None:
+        log.warning("userRole unavailable; cannot verify signer %s -> account %s",
+                    signer.signer_address, signer.account)
+        return
+    if role == "agent":
+        master = str((data.get("data") or {}).get("user") or "")
+        if master and master.lower() != signer.account.lower():
+            raise LiveGuardError(
+                f"preflight: signing key {signer.signer_address} is an agent of {master}, but "
+                f"HYPERLIQUID_ACCOUNT={signer.account}; set HYPERLIQUID_ACCOUNT={master}"
+            )
+        return
+    if signer.is_agent:
+        raise LiveGuardError(
+            f"preflight: key {signer.signer_address} is not an approved agent of {signer.account} "
+            f"(userRole={role!r}); orders would hit the key's own account"
+        )
+
+
+def check_clock(client: InfoClient, coin: str) -> None:
+    """只读：本机时钟和交易所时间对比。"""
+    try:
+        server_ms = int(client.l2_book(coin).get("time"))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("clock check skipped: %s", exc)
+        return
+    skew = int(time.time() * 1000) - server_ms
+    if abs(skew) > CLOCK_SKEW_MAX_MS:
+        raise LiveGuardError(f"preflight: local clock is {skew / 1000:+.1f}s off Hyperliquid; fix NTP first")
+    if abs(skew) > CLOCK_SKEW_WARN_MS:
+        log.warning("local clock is %+.1fs off Hyperliquid; check NTP", skew / 1000)
+
+
 def _run_supervised(quoter: LiveQuoter, feed: BookFeed, stop: dict[str, Any]) -> int:
     """到时/首个停止信号后只减仓；等待有界，不循环重启或自动购买额度。"""
     session = quoter.session
@@ -1474,6 +1515,8 @@ def run_live(settings: Settings, *, seconds: float | None = None,
             "AH markout stays in its own bucket."
         )
         _log_agent(client, signer)
+        check_signer_role(client, signer)
+        check_clock(client, settings.coins[0])
         quoter = LiveQuoter(settings, markets, client, signer)
         quoter.session = session
         quoter.preflight()

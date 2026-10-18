@@ -335,3 +335,73 @@ def test_session_loss_ignores_fills_from_before_start(markets, monkeypatch):
                           "fee": "0", "closedPnl": "-50"}], lambda _c: None, prime=True)
     q.step(None)
     assert not q.entry_halt
+
+
+class _RoleClient:
+    def __init__(self, data: Any) -> None:
+        self.data = data
+
+    def post_info(self, payload: dict[str, Any], **_kw: Any) -> Any:
+        assert payload["type"] == "userRole"
+        return self.data
+
+
+class _Signer:
+    def __init__(self, account: str, signer: str) -> None:
+        self.account, self.signer_address = account, signer
+        self.is_agent = account.lower() != signer.lower()
+
+
+def test_signer_role_must_match_account():
+    from entropy_bot.errors import LiveGuardError
+    from entropy_bot.live import check_signer_role
+
+    master, agent = "0x" + "11" * 20, "0x" + "ab" * 20
+    check_signer_role(_RoleClient({"role": "agent", "data": {"user": master}}), _Signer(master, agent))
+    check_signer_role(_RoleClient({"role": "user"}), _Signer(master, master))
+    check_signer_role(_RoleClient(None), _Signer(master, agent))  # 查不到：只告警
+    with pytest.raises(LiveGuardError):  # 漏填 HYPERLIQUID_ACCOUNT：会去查 agent 自己的空账户
+        check_signer_role(_RoleClient({"role": "agent", "data": {"user": master}}), _Signer(agent, agent))
+    with pytest.raises(LiveGuardError):  # 私钥不是这个账户的 agent
+        check_signer_role(_RoleClient({"role": "user"}), _Signer(master, agent))
+
+
+def test_clock_skew_refused(monkeypatch):
+    from entropy_bot.errors import LiveGuardError
+    from entropy_bot.live import check_clock
+
+    class Book:
+        def l2_book(self, coin: str) -> dict[str, Any]:
+            return {"time": 1_000_000_000_000}
+
+    monkeypatch.setattr("entropy_bot.live.time.time", lambda: 1_000_000_000.5)
+    check_clock(Book(), COIN)
+    monkeypatch.setattr("entropy_bot.live.time.time", lambda: 1_000_000_030.0)
+    with pytest.raises(LiveGuardError):
+        check_clock(Book(), COIN)
+
+
+@pytest.mark.parametrize("api,ws", [
+    ("https://evil.example/hyperliquid.xyz", "wss://api.hyperliquid.xyz/ws"),
+    ("https://api.hyperliquid.xyz.evil.example", "wss://api.hyperliquid.xyz/ws"),
+    ("http://api.hyperliquid.xyz", "wss://api.hyperliquid.xyz/ws"),
+    ("https://api.hyperliquid.xyz", "wss://evil.example/?h=hyperliquid.xyz"),
+])
+def test_endpoint_allowlist_checks_hostname(monkeypatch, api, ws):
+    from entropy_bot.config import load_settings
+    from entropy_bot.errors import ConfigError
+
+    monkeypatch.setattr("entropy_bot.config.load_dotenv", lambda *a, **k: False)
+    monkeypatch.setenv("HYPERLIQUID_API_URL", api)
+    monkeypatch.setenv("HYPERLIQUID_WS_URL", ws)
+    with pytest.raises(ConfigError):
+        load_settings()
+
+
+def test_nonce_strictly_increases_within_one_ms(monkeypatch):
+    from entropy_bot.orders import NonceClock
+
+    clock = NonceClock()
+    monkeypatch.setattr("entropy_bot.orders.time.time", lambda: 1_700_000_000.0)
+    first = clock.next()
+    assert [clock.next() for _ in range(3)] == [first + 1, first + 2, first + 3]

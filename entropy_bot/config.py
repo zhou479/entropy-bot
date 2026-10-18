@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -83,6 +84,18 @@ def _optional_env(name: str) -> str | None:
     return value or None
 
 
+OFFICIAL_HOST_SUFFIX = "hyperliquid.xyz"
+
+
+def _official_url(url: str, schemes: tuple[str, ...]) -> bool:
+    """按 hostname 精确判断；子串判断会放过 https://evil.example/hyperliquid.xyz。"""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme not in schemes:
+        return False
+    return host == OFFICIAL_HOST_SUFFIX or host.endswith("." + OFFICIAL_HOST_SUFFIX)
+
+
 def load_settings(dotenv_path: str | Path | None = None) -> Settings:
     load_dotenv(dotenv_path, override=False)
     coins_raw = os.environ.get("COINS", ",".join(ALLOWED_COINS))
@@ -138,7 +151,7 @@ def load_settings(dotenv_path: str | Path | None = None) -> Settings:
         raise ConfigError("Entropy rebate rates must be >= 0")
     api_url = _optional_env("HYPERLIQUID_API_URL") or DEFAULT_API_URL
     ws_url = _optional_env("HYPERLIQUID_WS_URL") or DEFAULT_WS_URL
-    if "hyperliquid.xyz" not in api_url or "hyperliquid.xyz" not in ws_url:
+    if not _official_url(api_url, ("https",)) or not _official_url(ws_url, ("wss",)):
         raise ConfigError("only official Hyperliquid HTTP/WS endpoints are allowed")
     return Settings(
         live=_truthy(os.environ.get("LIVE")),
