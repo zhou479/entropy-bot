@@ -158,3 +158,101 @@ def test_slot_verdict_rules():
     assert slot_verdict(ro, want, **kw) == "now"
     zero_tol = dict(kw, tolerance_ticks=0)
     assert slot_verdict(RestSlot(oid=1, px=1293.7, placed_at=990), want, **zero_tol) == "slow"
+
+
+class RejectingClient(BookKeepingClient):
+    def __init__(self, error: str) -> None:
+        super().__init__()
+        self.error = error
+        self.open_order_queries = 0
+
+    def post_exchange(self, payload: dict[str, Any]) -> Any:
+        if payload["action"]["type"] == "order" and self.error:
+            self.posts.append(payload)
+            st = [{"error": self.error}] * len(payload["action"]["orders"])
+            return {"status": "ok", "response": {"type": "order", "data": {"statuses": st}}}
+        return super().post_exchange(payload)
+
+    def open_orders(self, *args: object, **kwargs: object) -> list:
+        self.open_order_queries += 1
+        return super().open_orders()
+
+
+def _rejecting(markets, monkeypatch, error):
+    clock = Clock()
+    monkeypatch.setattr("entropy_bot.live.time.time", clock.time)
+    client = RejectingClient(error)
+    q = LiveQuoter(_settings(coins=(COIN,)), {COIN: markets[COIN]}, client, FakeSigner())
+    q.preflight()
+    return clock, client, q
+
+
+def test_margin_reject_backs_off_exponentially(markets, monkeypatch):
+    clock, client, q = _rejecting(markets, monkeypatch, "Insufficient margin to place order.")
+    orders = lambda: sum(1 for p in client.posts if p["action"]["type"] == "order")  # noqa: E731
+    quote(q, "1293.8", "1293.9")
+    assert orders() == 1
+    queries = client.open_order_queries
+    for _ in range(4):  # 2s 内不重试，也不反复拉挂单列表
+        clock.advance(0.4)
+        quote(q, "1293.8", "1293.9")
+    assert orders() == 1
+    assert client.open_order_queries == queries
+    clock.advance(0.5)
+    quote(q, "1293.8", "1293.9")
+    assert orders() == 2
+    clock.advance(3)
+    quote(q, "1293.8", "1293.9")
+    assert orders() == 2  # 第二次被拒后要等 4s
+    clock.advance(1.5)
+    quote(q, "1293.8", "1293.9")
+    assert orders() == 3
+
+
+def test_reject_streak_resets_after_success(markets, monkeypatch):
+    clock, client, q = _rejecting(markets, monkeypatch, "Insufficient margin to place order.")
+    quote(q, "1293.8", "1293.9")
+    clock.advance(2.5)
+    quote(q, "1293.8", "1293.9")
+    assert q._reject_streak[(COIN, "B")] == 2
+    client.error = ""
+    clock.advance(4.5)
+    quote(q, "1293.8", "1293.9")
+    assert q._has_rest(COIN)
+    assert (COIN, "B") not in q._reject_streak
+
+
+def test_ten_dollar_quotes_are_not_under_the_exchange_minimum(markets):
+    from entropy_bot.precision import order_size
+    from entropy_bot.quoting import quote_plan
+
+    assert order_size(10, 1293.8, 4) * 1293.8 >= 10
+    assert order_size(50, 1293.8, 4) == pytest.approx(0.0386)  # 正常金额不变
+    plan = quote_plan(markets[COIN], _top("1293.8", "1293.9", COIN), szi=0.0, age_ms=0, notional_usd=10)
+    assert all(i.px * i.sz >= 10 for i in plan.intents)
+
+
+def test_take_slippage_is_opt_in(markets):
+    from entropy_bot.quoting import quote_plan
+
+    top = _top("1293.8", "1293.9", COIN)
+    default = quote_plan(markets[COIN], top, szi=0.0386, age_ms=16_000, notional_usd=50)
+    assert default.intents[0].px == pytest.approx(1293.8)  # 原行为：正好打在买一
+    slipped = quote_plan(markets[COIN], top, szi=0.0386, age_ms=16_000, notional_usd=50,
+                         take_slippage_ticks=2)
+    assert slipped.intents[0].px == pytest.approx(1293.6)
+    short = quote_plan(markets[COIN], top, szi=-0.0386, age_ms=16_000, notional_usd=50,
+                       take_slippage_ticks=2)
+    assert short.intents[0].px == pytest.approx(1294.1)
+
+
+def test_position_over_cap_skips_the_alo_ladder(setup):
+    clock, client, q = setup
+    client.state = {"assetPositions": [{"position": {"coin": COIN, "szi": "0.2"}}]}  # ~$259 > $150
+    q.refresh_positions(force=True)
+    q.pos_since[COIN] = clock.t
+    plan = q.plan_for(COIN, _top("1293.8", "1293.9", COIN))
+    assert plan.take and plan.tif == "Ioc"
+    client.state = {"assetPositions": [{"position": {"coin": COIN, "szi": "0.03"}}]}
+    q.refresh_positions(force=True)
+    assert q.plan_for(COIN, _top("1293.8", "1293.9", COIN)).stage == "far"

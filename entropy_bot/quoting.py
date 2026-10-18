@@ -18,7 +18,7 @@ from entropy_bot.precision import (
     floor_size,
     floor_to_tick,
     round_price,
-    size_from_notional,
+    order_size,
     spread_bps,
     tick_size,
 )
@@ -243,8 +243,8 @@ def desired_quotes(
     if px is None:
         return []
     buy_px, sell_px = px
-    bid_sz = size_from_notional(notional_usd, buy_px, market.sz_decimals)
-    ask_sz = size_from_notional(notional_usd, sell_px, market.sz_decimals)
+    bid_sz = order_size(notional_usd, buy_px, market.sz_decimals)
+    ask_sz = order_size(notional_usd, sell_px, market.sz_decimals)
     if bid_sz <= 0 or ask_sz <= 0:
         return []
     return [
@@ -268,12 +268,25 @@ def flatten_size(abs_szi: float, notional_sz: float, sz_decimals: int) -> float:
     return floor_size(use, sz_decimals)
 
 
-def flatten_prices(market: Market, top: BookTop, stage: Stage) -> tuple[float, float] | None:
+def flatten_prices(
+    market: Market,
+    top: BookTop,
+    stage: Stage,
+    *,
+    take_slippage_ticks: int = 0,
+) -> tuple[float, float] | None:
     if top.bid is None or top.ask is None or top.bid <= 0 or top.ask <= 0:
         return None
     tick = top.inferred_tick(market.sz_decimals)
     if stage == "take":
-        return top.ask, top.bid  # short cover @ask / long exit @bid
+        slip = max(0, int(take_slippage_ticks)) * tick
+        if slip <= 0:
+            return top.ask, top.bid  # short cover @ask / long exit @bid
+        # 多穿几个 tick：第一档很薄时，IOC 不至于每次都落空。
+        buy = _round_side(ceil_to_tick(top.ask + slip, tick), market.sz_decimals, side="ask")
+        sell = top.bid - slip if top.bid - slip > 0 else top.bid
+        sell = _round_side(floor_to_tick(sell, tick), market.sz_decimals, side="bid")
+        return buy, sell
     if stage == "mid":
         mid = top.mid if top.mid and top.mid > 0 else (top.bid + top.ask) / 2.0
         mid_px = _round_side(mid, market.sz_decimals, side="nearest")
@@ -297,6 +310,7 @@ def quote_plan(
     szi: float,
     age_ms: int,
     notional_usd: float,
+    take_slippage_ticks: int = 0,
 ) -> QuotePlan:
     stage = flatten_stage(age_ms, szi)
     if abs(szi) <= 0:
@@ -305,8 +319,8 @@ def quote_plan(
         buy_px = sell_px = None
         if px is not None:
             buy_px, sell_px = px
-            buy_sz = size_from_notional(notional_usd, buy_px, market.sz_decimals)
-            sell_sz = size_from_notional(notional_usd, sell_px, market.sz_decimals)
+            buy_sz = order_size(notional_usd, buy_px, market.sz_decimals)
+            sell_sz = order_size(notional_usd, sell_px, market.sz_decimals)
             if buy_sz > 0:
                 intents.append(
                     QuoteIntent(market.coin, market.asset_id, True, buy_px, buy_sz, "B", "Alo", False, "flat")
@@ -319,7 +333,7 @@ def quote_plan(
 
     take = stage == "take"
     tif = "Ioc" if take else "Alo"
-    raw = flatten_prices(market, top, stage)
+    raw = flatten_prices(market, top, stage, take_slippage_ticks=take_slippage_ticks)
     if raw is None:
         return QuotePlan(market.coin, "long" if szi > 0 else "short", stage, tif, take, [], age_ms, szi)
     buy_raw, sell_raw = raw
@@ -331,7 +345,7 @@ def quote_plan(
             if sell_raw_c is None:
                 return QuotePlan(market.coin, "long", stage, tif, take, [], age_ms, szi)
             sell_raw = sell_raw_c
-        notional_sz = size_from_notional(notional_usd, sell_raw, market.sz_decimals)
+        notional_sz = order_size(notional_usd, sell_raw, market.sz_decimals)
         sz = flatten_size(abs(szi), notional_sz, market.sz_decimals)
         if sz > 0:
             sell_px = sell_raw
@@ -345,7 +359,7 @@ def quote_plan(
         if buy_raw_c is None:
             return QuotePlan(market.coin, "short", stage, tif, take, [], age_ms, szi)
         buy_raw = buy_raw_c
-    notional_sz = size_from_notional(notional_usd, buy_raw, market.sz_decimals)
+    notional_sz = order_size(notional_usd, buy_raw, market.sz_decimals)
     sz = flatten_size(abs(szi), notional_sz, market.sz_decimals)
     if sz > 0:
         buy_px = buy_raw

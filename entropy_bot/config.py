@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 
 from entropy_bot.coins import ALLOWED_COINS, validate_coin_list
 from entropy_bot.errors import ConfigError, LiveGuardError
+from entropy_bot.precision import MIN_NOTIONAL_USD
 from entropy_bot.fees import (
     DEFAULT_ENTROPY_REFERRAL_REWARD,
     DEFAULT_ENTROPY_REFERRED_USER_BENEFIT,
@@ -26,7 +27,9 @@ DEFAULT_MAX_LEVERAGE = 2
 DEFAULT_MIN_REPLACE_S = 12.0
 DEFAULT_REQUOTE_TOLERANCE_TICKS = 1
 DEFAULT_STALE_QUOTE_S = 120.0
-MIN_ORDER_USD = 10.0
+DEFAULT_TAKE_SLIPPAGE_TICKS = 0
+DEFAULT_MAX_POSITION_MULT = 3.0
+MIN_ORDER_USD = MIN_NOTIONAL_USD
 
 
 @dataclass(frozen=True)
@@ -52,6 +55,10 @@ class Settings:
     requote_tolerance_ticks: int = DEFAULT_REQUOTE_TOLERANCE_TICKS
     # 空仓挂单超过 N 秒价格没变也刷新一次。0 = 关闭。（原固定 45 秒）
     stale_quote_s: float = DEFAULT_STALE_QUOTE_S
+    # 减仓 IOC 比盘口多穿 N 个 tick。0 = 原行为（正好打在买一/卖一）。
+    take_slippage_ticks: int = DEFAULT_TAKE_SLIPPAGE_TICKS
+    # 仓位名义金额达到这个值就跳过 ALO 阶梯直接 IOC。None = 3 x QUOTE_NOTIONAL_USD。
+    max_position_usd: float | None = None
 
     @property
     def paper(self) -> bool:
@@ -97,14 +104,19 @@ def load_settings(dotenv_path: str | Path | None = None) -> Settings:
         min_replace_s = float(os.environ.get("MIN_REPLACE_S", DEFAULT_MIN_REPLACE_S))
         tol_ticks = int(os.environ.get("REQUOTE_TOLERANCE_TICKS", DEFAULT_REQUOTE_TOLERANCE_TICKS))
         stale_quote_s = float(os.environ.get("STALE_QUOTE_S", DEFAULT_STALE_QUOTE_S))
+        take_slip = int(os.environ.get("TAKE_SLIPPAGE_TICKS", DEFAULT_TAKE_SLIPPAGE_TICKS))
+        max_pos_raw = _optional_env("MAX_POSITION_USD")
+        max_pos = float(max_pos_raw) if max_pos_raw is not None else None
     except ValueError as exc:
         raise ConfigError(f"invalid numeric config: {exc}") from exc
     if notional <= 0 or offset < 0 or max_lev < 1:
         raise ConfigError("QUOTE_NOTIONAL_USD, QUOTE_OFFSET_TICKS, MAX_LEVERAGE must be positive")
     if min_replace_s < 0:
         raise ConfigError("MIN_REPLACE_S must be >= 0")
-    if tol_ticks < 0 or stale_quote_s < 0:
-        raise ConfigError("REQUOTE_TOLERANCE_TICKS and STALE_QUOTE_S must be >= 0")
+    if tol_ticks < 0 or stale_quote_s < 0 or take_slip < 0:
+        raise ConfigError("REQUOTE_TOLERANCE_TICKS, STALE_QUOTE_S, TAKE_SLIPPAGE_TICKS must be >= 0")
+    if max_pos is not None and max_pos <= 0:
+        raise ConfigError("MAX_POSITION_USD must be > 0 when set")
     rates_for_tier(fee_tier)
     entropy_program(entropy_tier)
     if not 0.0 <= referral < 1.0:
@@ -135,6 +147,8 @@ def load_settings(dotenv_path: str | Path | None = None) -> Settings:
         min_replace_s=min_replace_s,
         requote_tolerance_ticks=tol_ticks,
         stale_quote_s=stale_quote_s,
+        take_slippage_ticks=take_slip,
+        max_position_usd=max_pos,
     )
 
 
@@ -153,3 +167,9 @@ def require_signer(settings: Settings) -> None:
 def live_notional(settings: Settings) -> float:
     """Default ~$50/side, never below the $10 exchange minimum."""
     return max(MIN_ORDER_USD, settings.quote_notional_usd)
+
+
+def max_position_usd(settings: Settings) -> float:
+    if settings.max_position_usd is not None:
+        return settings.max_position_usd
+    return live_notional(settings) * DEFAULT_MAX_POSITION_MULT

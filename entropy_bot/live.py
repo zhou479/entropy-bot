@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from entropy_bot.coins import ALLOWED_DEX, Market, perp_dex_info
-from entropy_bot.config import Settings, live_notional, require_live
+from entropy_bot.config import Settings, live_notional, max_position_usd, require_live
 from entropy_bot.fees import (
     ALO_TIF_NOTE,
     alo_fill_rebate_usd,
@@ -38,6 +38,7 @@ from entropy_bot.orders import (
     status_oid,
 )
 from entropy_bot.quoting import (
+    FLAT_TAKE_MS,
     BookTop,
     QuotePlan,
     book_top,
@@ -67,6 +68,11 @@ DEADMAN_REMAIN_LT_S = 8.0
 DEADMAN_REFRESH_S = DEADMAN_REMAIN_LT_S  # alias: refresh only when remaining < 8s
 IOC_GAP_S = 3.0  # 首次退出仍是 >=15s；后续重试共享节流，避免 info 查询耗尽 IP 权重。
 WEIGHT_BACKOFF_FLOOR_S = 30.0
+ALO_REJECT_RETRY_S = 2.0
+# 其它拒单（保证金不足、builder 未授权、数量不对……）按侧退避 2s、4s、…、最长 60s，
+# 每轮都重试同一个必拒的单只会消耗请求额度。
+ORDER_REJECT_BASE_S = 2.0
+ORDER_REJECT_MAX_S = 60.0
 
 
 @dataclass
@@ -364,6 +370,9 @@ class LiveQuoter:
     _position_generation: int = -1
     next_safety_poll: dict[str, float] = field(default_factory=dict)
     session: SupervisedSession | None = None
+    _reject_until: dict[tuple[str, str], float] = field(default_factory=dict)
+    _reject_streak: dict[tuple[str, str], int] = field(default_factory=dict)
+    _maxpos_logged: dict[str, bool] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.notional:
@@ -633,13 +642,39 @@ class LiveQuoter:
         szi = self.pos.get(coin, 0.0)
         since = self.pos_since.get(coin, 0.0)
         age_ms = int(max(0.0, (now - since) * 1000)) if since and abs(szi) > 0 else 0
+        cap = max_position_usd(self.settings)
+        mid = top.mid or 0.0
+        if abs(szi) > 0 and mid > 0 and abs(szi) * mid >= cap:
+            if not self._maxpos_logged.get(coin):
+                log.warning("position %s $%.2f >= MAX_POSITION_USD $%.2f; skip ALO ladder, IOC now",
+                            coin, abs(szi) * mid, cap)
+                self._maxpos_logged[coin] = True
+            age_ms = max(age_ms, FLAT_TAKE_MS)
+        else:
+            self._maxpos_logged[coin] = False
         return quote_plan(
             self.markets[coin],
             top,
             szi=szi,
             age_ms=age_ms,
             notional_usd=self.notional,
+            take_slippage_ticks=self.settings.take_slippage_ticks,
         )
+
+    def _note_reject(self, coin: str, side: str, *, alo: bool) -> float:
+        key = (coin, side)
+        now = time.time()
+        if alo:
+            wait = ALO_REJECT_RETRY_S
+        else:
+            streak = self._reject_streak.get(key, 0)
+            wait = min(ORDER_REJECT_MAX_S, ORDER_REJECT_BASE_S * (2 ** streak))
+            self._reject_streak[key] = streak + 1
+        self._reject_until[key] = max(self._reject_until.get(key, 0.0), now + wait)
+        return wait
+
+    def _cooling_down(self, coin: str, side: str) -> bool:
+        return time.time() < self._reject_until.get((coin, side), 0.0)
 
     def _post(self, payload: dict[str, Any], *, purpose: str = "maintenance", actions: int = 1) -> Any:
         now = time.time()
@@ -883,6 +918,9 @@ class LiveQuoter:
         specs = []
         pending: list[tuple[str, Any]] = []
         for intent in plan.intents:
+            if not plan.take and self._cooling_down(coin, intent.side):
+                log.debug("%s %s in reject cool-down; not placing", coin, intent.side)
+                continue
             if side_occupied(self.rests, coin, intent.side):
                 # 这一侧的挂单在容差内被保留；绝不在同一侧再挂第二张。
                 log.debug("keep %s %s rest; not placing a second order on that side", coin, intent.side)
@@ -932,8 +970,12 @@ class LiveQuoter:
             if is_alo_reject(resp):
                 log.warning("ALO px rejected, will requote %s", coin)
                 self.last_plan_key[coin] = ""
+                for side, _intent in pending:
+                    self._note_reject(coin, side, alo=True)
                 return {"aloReject": True, "resp": resp}
-            log.warning("order not ok %s %s", coin, resp)
+            for side, _intent in pending:
+                wait = self._note_reject(coin, side, alo=False)
+            log.warning("order not ok %s %s (retry in %.0fs)", coin, resp, wait)
             return {"rejected": True, "resp": resp}
         statuses = resp_statuses(resp)
         if len(statuses) > len(pending):
@@ -954,12 +996,15 @@ class LiveQuoter:
                     alo_rejected = True
                     log.warning("ALO px rejected, will requote %s %s", coin, err)
                     self.last_plan_key[coin] = ""
+                    self._note_reject(coin, _side, alo=True)
                     continue
                 if plan.take:
                     log.warning("IOC flatten status %s %s", coin, err)
                     continue
-                log.warning("order status %s %s", coin, err)
+                wait = self._note_reject(coin, _side, alo=False)
+                log.warning("order status %s %s %s (retry that side in %.0fs)", coin, _side, err, wait)
                 continue
+            self._reject_streak.pop((coin, _side), None)
             if isinstance(st, dict) and isinstance(st.get("filled"), dict):
                 # IOC 全部/部分成交均不会成为挂单；仓位由新查询确认。
                 self.positions_valid = False
@@ -1101,9 +1146,10 @@ class LiveQuoter:
             )
             if verdict == "now":
                 urgent.append(side)
-            elif verdict == "slow":
-                reprice.append(side)
-        missing = [side for side in desired if not side_occupied(self.rests, coin, side)]
+            elif verdict == "slow" and not self._cooling_down(coin, side):
+                reprice.append(side)  # 冷却中的一侧不改价：旧单留着，好过撤了挂不上
+        missing = [side for side in desired
+                   if not side_occupied(self.rests, coin, side) and not self._cooling_down(coin, side)]
         elapsed = now - self.last_replace.get(coin, 0.0)
         throttled = not replace_allowed(
             take=False,
