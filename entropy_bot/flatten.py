@@ -40,7 +40,10 @@ def _acquire_run_lock() -> Any:
     if not os.path.isdir(state_dir):
         log.warning("run lock dir %s missing; cannot check for a running bot — make sure none is", state_dir)
         return None
-    handle = open(path, "a")  # noqa: SIM115 - 进程结束前一直持有
+    try:
+        handle = open(path, "a")  # noqa: SIM115 - 进程结束前一直持有
+    except OSError as exc:
+        raise LiveGuardError(f"cannot open run lock {path} ({exc}); run flatten as the service user") from exc
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as exc:
@@ -105,7 +108,11 @@ def run_flatten(settings: Settings, *, assume_yes: bool = False) -> int:
                             signer.signed_cancel_oids([(markets[coin].asset_id, oid) for oid in oids]))
                         log.info("cancel %s %s confirmed=%s", coin, oids, cancel_confirmed(resp, len(oids)))
                 for coin, szi in open_pos.items():
-                    top = book_top(coin, client.l2_book(coin))
+                    try:
+                        top = book_top(coin, client.l2_book(coin) or {})
+                    except Exception as exc:  # noqa: BLE001 - 网络抖动不能中断紧急平仓
+                        log.warning("l2Book %s failed (%s); retrying", coin, exc)
+                        continue
                     if top.bid is None or top.ask is None:
                         log.warning("no book for %s; retrying", coin)
                         continue

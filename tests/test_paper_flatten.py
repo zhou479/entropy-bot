@@ -9,7 +9,7 @@ import pytest
 from entropy_bot.errors import LiveGuardError
 from entropy_bot.live import LiveQuoter
 from entropy_bot.paper import PaperExchange, PaperSigner
-from test_live_throttle import Clock, FakeClient, FakeSigner, _settings
+from test_live_throttle import Clock, FakeClient, FakeSigner, _book_data, _settings
 
 SNDK = "io:SNDK"
 ANTH = "io:ANTH"
@@ -181,3 +181,51 @@ def test_flatten_reports_failure_when_position_stays(markets, monkeypatch, tmp_p
     client = Stuck("0.02")
     mod, _ = _patch_flatten(monkeypatch, client, markets, tmp_path)
     assert mod.run_flatten(_settings(coins=(SNDK,)), assume_yes=True) == 3
+
+
+def test_paper_charges_maker_fees(markets):
+    ex = PaperExchange({SNDK: markets[SNDK]}, None, _settings(coins=(SNDK,), fee_tier=0))
+    ex.on_book(SNDK, book("1293.8", "1293.9"))
+    ex.post_exchange(_order(markets, True, 1293.8, 0.04))
+    ex.on_book(SNDK, book("1293.6", "1293.8"))
+    assert ex.fills and not ex.fills[0]["crossed"]
+    assert float(ex.fills[0]["fee"]) > 0, "tier 0 的 HIP-3 maker 费率不是 0"
+
+
+def test_flatten_survives_a_book_fetch_error(markets, monkeypatch, tmp_path):
+    client = FlattenClient("0.02")
+    calls = {"n": 0}
+
+    def flaky_book(coin: str) -> dict[str, Any]:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ConnectionError("blip")
+        return _book_data("1985.0", "1985.1")
+
+    client.l2_book = flaky_book  # type: ignore[method-assign]
+    mod, _ = _patch_flatten(monkeypatch, client, markets, tmp_path)
+    assert mod.run_flatten(_settings(coins=(SNDK,)), assume_yes=True) == 0
+    assert calls["n"] >= 2
+
+
+def test_flatten_unwritable_lock_dir_is_a_clear_error(markets, monkeypatch, tmp_path):
+    client = FlattenClient("0.02")
+    mod, _ = _patch_flatten(monkeypatch, client, markets, tmp_path)
+
+    def denied(*_a, **_k):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr("builtins.open", denied)
+    with pytest.raises(LiveGuardError, match="service user"):
+        mod.run_flatten(_settings(coins=(SNDK,)), assume_yes=True)
+
+
+def test_paper_position_has_no_float_dust(markets):
+    ex = _paper(markets)
+    ex.pos[SNDK] = -0.0392
+    ex.entry[SNDK] = 1275.0
+    ex.on_book(SNDK, book("1275.5", "1275.6"))
+    ex.post_exchange(_order(markets, True, 1275.6, 0.0391, ro=True, tif="Ioc"))
+    assert ex.pos[SNDK] == pytest.approx(-0.0001, abs=0)
+    ex.post_exchange(_order(markets, True, 1275.6, 0.0001, ro=True, tif="Ioc"))
+    assert ex.pos[SNDK] == 0.0

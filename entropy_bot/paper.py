@@ -70,9 +70,10 @@ class PaperExchange:
         self.fees_paid = 0.0
         self.fills: list[dict[str, Any]] = []
         self.actions: dict[str, int] = {}
-        self._taker_rate = {
-            coin: estimate_from_settings(m, settings).gross_taker_pct / 100.0 for coin, m in markets.items()
-        }
+        fees = {coin: estimate_from_settings(m, settings) for coin, m in markets.items()}
+        # 按成交当时扣的毛费率算（返佣事后才到账）。
+        self._taker_rate = {coin: f.gross_taker_pct / 100.0 for coin, f in fees.items()}
+        self._maker_rate = {coin: f.gross_maker_pct / 100.0 for coin, f in fees.items()}
         self._oid = 9_000_000_000_000
         self._tid = 0
         self._lock = threading.RLock()
@@ -186,7 +187,8 @@ class PaperExchange:
         closed = 0.0
         if before and (before > 0) != (signed > 0):
             closed = (px - self.entry[coin]) * min(abs(before), abs(signed)) * (1 if before > 0 else -1)
-        after = before + signed
+        # 交易所的仓位是整数个最小单位；浮点累加会留下 0.0000999… 这种假零头。
+        after = round(before + signed, self.markets[coin].sz_decimals)
         if abs(after) <= 1e-9:
             after = 0.0
             self.entry[coin] = 0.0
@@ -195,7 +197,7 @@ class PaperExchange:
         elif (before > 0) == (signed > 0):
             self.entry[coin] = (self.entry[coin] * abs(before) + px * sz) / abs(after)
         self.pos[coin] = after
-        fee = px * sz * self._taker_rate[coin] if crossed else 0.0
+        fee = px * sz * (self._taker_rate[coin] if crossed else self._maker_rate[coin])
         self.realized[coin] += closed
         self.fees_paid += fee
         self._tid += 1
@@ -247,7 +249,7 @@ class PaperExchange:
             return (
                 f"PAPER SUMMARY fills={len(self.fills)} (maker {maker} / taker {len(self.fills) - maker}) "
                 f"volume=${volume:.2f} positions={self.pos} realized=${realized:.4f} "
-                f"taker_fees=${self.fees_paid:.4f} net=${realized - self.fees_paid:.4f} "
+                f"fees=${self.fees_paid:.4f} net=${realized - self.fees_paid:.4f} "
                 f"signed_actions_if_live={sum(self.actions.values())} {self.actions}"
             )
 

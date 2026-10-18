@@ -8,11 +8,12 @@ Live MM (userscript 1.6.1):
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from entropy_bot.coins import Market
 from entropy_bot.precision import (
+    MIN_NOTIONAL_USD,
     book_tick,
     ceil_to_tick,
     floor_size,
@@ -25,7 +26,6 @@ from entropy_bot.precision import (
 
 FLAT_FAR_MS = 6_000
 FLAT_TAKE_MS = 15_000
-STALE_QUOTE_MS = 45_000
 
 Stage = Literal["flat", "far", "mid", "take"]
 Mode = Literal["flat", "long", "short"]
@@ -99,22 +99,6 @@ class QuotePlan:
                 f"{intent.side}:{intent.px}:{intent.sz}:{int(intent.reduce_only)}:{intent.tif}"
             )
         return "|".join(parts)
-
-
-@dataclass
-class PaperFill:
-    coin: str
-    side: str
-    px: float
-    sz: float
-    reason: str
-
-
-@dataclass
-class PaperState:
-    quotes: dict[str, dict[str, QuoteIntent]] = field(default_factory=dict)
-    fills: list[PaperFill] = field(default_factory=list)
-    position: dict[str, float] = field(default_factory=dict)
 
 
 def _level_px(row: Any) -> tuple[float | None, str | None]:
@@ -263,8 +247,12 @@ def flatten_stage(age_ms: int, szi: float) -> Stage:
     return "far"
 
 
-def flatten_size(abs_szi: float, notional_sz: float, sz_decimals: int) -> float:
+def flatten_size(abs_szi: float, notional_sz: float, sz_decimals: int, *, px: float | None = None) -> float:
     use = min(abs(abs_szi), notional_sz) if notional_sz > 0 else abs(abs_szi)
+    # 剩下的部分不到 $10 就一次平掉整仓：否则价格一涨，按金额算的数量少一个最小单位，
+    # 会留下一笔零头（例如 0.0392 只平掉 0.0391），还要再走一轮平仓。
+    if px and abs(abs_szi) > use and (abs(abs_szi) - use) * px < MIN_NOTIONAL_USD:
+        use = abs(abs_szi)
     return floor_size(use, sz_decimals)
 
 
@@ -346,7 +334,7 @@ def quote_plan(
                 return QuotePlan(market.coin, "long", stage, tif, take, [], age_ms, szi)
             sell_raw = sell_raw_c
         notional_sz = order_size(notional_usd, sell_raw, market.sz_decimals)
-        sz = flatten_size(abs(szi), notional_sz, market.sz_decimals)
+        sz = flatten_size(abs(szi), notional_sz, market.sz_decimals, px=sell_raw)
         if sz > 0:
             sell_px = sell_raw
             intents.append(
@@ -360,7 +348,7 @@ def quote_plan(
             return QuotePlan(market.coin, "short", stage, tif, take, [], age_ms, szi)
         buy_raw = buy_raw_c
     notional_sz = order_size(notional_usd, buy_raw, market.sz_decimals)
-    sz = flatten_size(abs(szi), notional_sz, market.sz_decimals)
+    sz = flatten_size(abs(szi), notional_sz, market.sz_decimals, px=buy_raw)
     if sz > 0:
         buy_px = buy_raw
         intents.append(
@@ -384,34 +372,3 @@ def sync_pos_since(
         elif abs(had) <= 0 or (had > 0) != (szi > 0) or not updated.get(coin):
             updated[coin] = now
     return updated
-
-
-def detect_paper_fills(
-    state: PaperState,
-    top: BookTop,
-) -> list[PaperFill]:
-    fills: list[PaperFill] = []
-    live = state.quotes.get(top.coin) or {}
-    bid = live.get("B")
-    ask = live.get("A")
-    if bid and top.ask is not None and top.ask <= bid.px:
-        sz = min(bid.sz, top.ask_sz or bid.sz)
-        if sz > 0:
-            fills.append(PaperFill(top.coin, "B", bid.px, sz, "ask crossed paper bid"))
-    if ask and top.bid is not None and top.bid >= ask.px:
-        sz = min(ask.sz, top.bid_sz or ask.sz)
-        if sz > 0:
-            fills.append(PaperFill(top.coin, "A", ask.px, sz, "bid crossed paper ask"))
-    for fill in fills:
-        signed = fill.sz if fill.side == "B" else -fill.sz
-        state.position[fill.coin] = state.position.get(fill.coin, 0.0) + signed
-        state.fills.append(fill)
-    return fills
-
-
-def install_quotes(state: PaperState, intents: list[QuoteIntent]) -> None:
-    by_coin: dict[str, dict[str, QuoteIntent]] = {}
-    for intent in intents:
-        by_coin.setdefault(intent.coin, {})[intent.side] = intent
-    for coin, sides in by_coin.items():
-        state.quotes[coin] = sides

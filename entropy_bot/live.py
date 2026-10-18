@@ -175,6 +175,12 @@ def apply_open_orders(
                 slot.placed_at, slot.stage = old.placed_at, old.stage
             else:
                 slot.stage = "unknown"  # 不知道是哪一阶段的单：下一轮按"类型不对"立即替换
+            try:  # 部分成交后交易所给的是剩余数量
+                remaining = float(order["sz"])
+                if math.isfinite(remaining) and remaining > 0:
+                    slot.sz = remaining
+            except (KeyError, TypeError, ValueError):
+                pass
             slot.oid = oid
             slot.cloid = cloid if isinstance(cloid, str) else None
             try:
@@ -341,8 +347,6 @@ class LiveQuoter:
     extra_oids: dict[str, list[int]] = field(default_factory=dict)
     pos: dict[str, float] = field(default_factory=dict)
     pos_since: dict[str, float] = field(default_factory=dict)
-    last_plan_key: dict[str, str] = field(default_factory=dict)
-    quote_placed_at: dict[str, float] = field(default_factory=dict)
     last_take_at: dict[str, float] = field(default_factory=dict)
     last_pos_poll: float = 0.0
     last_fill_poll: float = 0.0
@@ -1013,7 +1017,6 @@ class LiveQuoter:
                 return {"iocFail": True, "resp": resp}
             if is_alo_reject(resp):
                 log.warning("ALO px rejected, will requote %s", coin)
-                self.last_plan_key[coin] = ""
                 for side, _intent in pending:
                     self._note_reject(coin, side, alo=True)
                 return {"aloReject": True, "resp": resp}
@@ -1039,7 +1042,6 @@ class LiveQuoter:
                 if is_alo_reject(err):
                     alo_rejected = True
                     log.warning("ALO px rejected, will requote %s %s", coin, err)
-                    self.last_plan_key[coin] = ""
                     self._note_reject(coin, _side, alo=True)
                     continue
                 if plan.take:
@@ -1086,7 +1088,7 @@ class LiveQuoter:
         )
         self._diag_quotes(coin, accepted, take=plan.take)
         return {"resp": resp, "rejected": rejected > 0, "aloReject": alo_rejected,
-                "blocked": self.unknown_write, "planKey": plan.key()}
+                "blocked": self.unknown_write}
 
     def requote(self, coin: str, top: BookTop) -> None:
         plan_started = time.time()
@@ -1104,7 +1106,9 @@ class LiveQuoter:
             self._note_block(coin, block)
         if plan.mode == "flat" and (block or not self.entry_allowed()):
             self.next_safety_poll[coin] = time.time() + 5.0
-            self.cancel_coin_rests(only_coin=coin)
+            # 暂停期间可能持续数小时：没有挂单就不必每 5 秒拉一次挂单列表。
+            if not block or self._has_rest(coin) or self.extra_oids.get(coin):
+                self.cancel_coin_rests(only_coin=coin)
             return
         if plan.mode != "flat" and self.entry_halt and not plan.take:
             # 限额期间不消耗稀缺动作重报 ALO，先撤增仓单，15s 后才走原 IOC 阶梯。
@@ -1113,12 +1117,6 @@ class LiveQuoter:
             return
         if plan.mode != "flat" and time.time() < self.next_exit_at:
             return
-        stale = (
-            plan.mode == "flat"
-            and self.settings.stale_quote_s > 0
-            and self.quote_placed_at.get(coin, 0) > 0
-            and time.time() - self.quote_placed_at[coin] > self.settings.stale_quote_s
-        )
         have_buy = side_occupied(self.rests, coin, "B")
         have_sell = side_occupied(self.rests, coin, "A")
         if plan.take:
@@ -1159,14 +1157,11 @@ class LiveQuoter:
                     log.warning("ALO/post-only reject on take path %s: %s", coin, exc)
                 else:
                     log.warning("IOC flatten retry %s: %s", coin, exc)
-            self.last_plan_key[coin] = ""
-            self.quote_placed_at[coin] = 0.0
             self.refresh_positions(force=True)
             self.maybe_deadman()
             return
         if not plan.intents:
             log.warning("no maker plan %s; skip", coin)
-            self.last_plan_key[coin] = ""
             self.maybe_deadman()
             return
         # 两侧分开判断：在容差内的挂单不动；类型不对的立即撤；只是价格偏了的按节流替换。
@@ -1228,8 +1223,6 @@ class LiveQuoter:
                     log.warning("sweep extras %s: %s", coin, extra_exc)
             self.maybe_deadman()
             return
-        if stale:
-            log.info("stale quote refresh %s", coin)
         log.info("requote %s stage=%s cancel=%s place=%s", coin, plan.stage, cancel_sides,
                  sorted(set(missing) | {s for s in cancel_sides if s in desired}))
         try:
@@ -1238,7 +1231,6 @@ class LiveQuoter:
         except Exception as exc:  # noqa: BLE001
             if is_alo_reject(exc):
                 log.warning("ALO reject during cancel/replace %s: %s", coin, exc)
-                self.last_plan_key[coin] = ""
                 return
             log.warning("cancel before replace %s: %s", coin, exc)
             return
@@ -1254,7 +1246,6 @@ class LiveQuoter:
             return
         fresh_plan = self.plan_for(coin, top)
         if fresh_plan.mode != plan.mode or fresh_plan.szi != plan.szi:
-            self.last_plan_key[coin] = ""
             return
         if plan.mode == "flat":
             self.maybe_deadman()
@@ -1273,19 +1264,14 @@ class LiveQuoter:
         except Exception as exc:  # noqa: BLE001
             if is_alo_reject(exc):
                 log.warning("ALO px rejected, will requote %s: %s", coin, exc)
-                self.last_plan_key[coin] = ""
                 self._mark_replaced(coin)
                 return
             log.warning("place failed %s: %s", coin, exc)
             self._mark_replaced(coin)
             return
         if not placed or placed.get("aloReject") or placed.get("rejected") or placed.get("blocked"):
-            self.last_plan_key[coin] = ""
             self._mark_replaced(coin)
             return
-        # _place 可能用新盘口重算过；缓存必须对应实际发出的计划。
-        self.last_plan_key[coin] = placed["planKey"]
-        self.quote_placed_at[coin] = time.time() if plan.mode == "flat" else 0.0
         self._mark_replaced(coin)
         self.maybe_deadman()
 
@@ -1314,7 +1300,6 @@ class LiveQuoter:
             except Exception as exc:  # noqa: BLE001
                 if is_alo_reject(exc):
                     log.warning("ALO px rejected, will requote %s: %s", coin, exc)
-                    self.last_plan_key[coin] = ""
                     continue
                 log.warning("live step %s: %s", coin, exc)
                 self.next_safety_poll[coin] = time.time() + 5.0
@@ -1511,7 +1496,7 @@ def run_live(settings: Settings, *, seconds: float | None = None,
         log.info(
             "fill-diag observe-only: FILL_DIAG jsonl per fill (+3s markout) and "
             "quote/fill counters split io:ANTH vs io:SNDK. SNDK session=rth|ah "
-            "(Mon–Fri 09:30–16:00 America/New_York; no holiday calendar). "
+            "(NYSE regular hours incl. holidays / early closes, entropy_bot/market_hours.py). "
             "AH markout stays in its own bucket."
         )
         _log_agent(client, signer)

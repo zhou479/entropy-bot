@@ -2,7 +2,7 @@
 
 Logging only. Does not choose prices, sizes, cancels, or dead-man timing.
 
-Sessions use the static NYSE calendar in `entropy_bot.session` (holidays and
+Sessions use the static NYSE calendar in `entropy_bot.market_hours` (holidays and
 13:00 early closes). Everything outside regular hours is `ah`. AH markout is
 labeled and kept in its own SNDK bucket; it is never folded into an RTH average.
 
@@ -256,10 +256,6 @@ class FillDiagnostics:
         with self._lock:
             return self.run_pnl
 
-    def day_net_pnl(self, day: str | None = None) -> float:
-        """Realized `closedPnl - fee` across all diag coins for one UTC day."""
-        with self._lock:
-            return self.day_pnl.get(day or utc_day(), 0.0)
 
     def _remember(self, bucket: set[str], order: deque[str], key: str) -> None:
         bucket.add(key)
@@ -288,6 +284,9 @@ class FillDiagnostics:
         now: float | None = None,
         when: datetime | None = None,
     ) -> list[PendingMarkout]:
+        # 只有第一份快照算"启动前的历史"。WS 每次重连都会重发快照，
+        # 之后快照里没见过的成交是断线期间发生的，必须照常计入（包括会话盈亏）。
+        prime = prime and not self.primed
         if not raw_fills:
             if prime:
                 self.primed = True
@@ -347,7 +346,8 @@ class FillDiagnostics:
                 return None
             self._remember(self.seen, self._seen_order, key)
             day = utc_day(fill_when)
-            # Today's snapshot fills still count toward the daily loss limit.
+            # 只用于 FILL_DIAG 里的 day_net_pnl 展示：当天启动前的成交也算进当天合计。
+            # （风控用的是 run_pnl，只算启动后的成交。）
             if not prime or day == utc_day():
                 self.day_pnl[day] = self.day_pnl.get(day, 0.0) + (closed or 0.0) - (fee or 0.0)
             if prime:

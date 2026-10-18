@@ -405,3 +405,51 @@ def test_nonce_strictly_increases_within_one_ms(monkeypatch):
     monkeypatch.setattr("entropy_bot.orders.time.time", lambda: 1_700_000_000.0)
     first = clock.next()
     assert [clock.next() for _ in range(3)] == [first + 1, first + 2, first + 3]
+
+
+def test_long_pause_without_rests_does_not_poll_open_orders(markets, monkeypatch):
+    monkeypatch.setattr("entropy_bot.live.is_rth", lambda: False)
+    clock, client, q = _gated(markets, monkeypatch, rth_only_coins=(COIN,))
+    calls = []
+    original = client.open_orders
+    monkeypatch.setattr(client, "open_orders", lambda *a, **k: calls.append(1) or original())
+    for _ in range(20):  # 100 秒非交易时段，手上没有挂单
+        clock.advance(5.1)
+        quote(q, "1293.8", "1293.9")
+    assert not calls and not client.posts
+
+
+def test_refetch_keeps_exchange_remaining_size(markets):
+    from entropy_bot.live import apply_open_orders, empty_rests
+
+    rests = empty_rests((COIN,))
+    rests[COIN]["A"] = RestSlot(oid=5, px=1294.0, sz=0.02, reduce_only=True, stage="far", placed_at=1.0)
+    opens = [{"coin": COIN, "oid": 5, "side": "A", "limitPx": "1294.0", "sz": "0.005"}]
+    rebuilt, _ = apply_open_orders(rests, {COIN: []}, opens, {COIN: markets[COIN]})
+    a = rebuilt[COIN]["A"]
+    assert (a.sz, a.stage, a.reduce_only) == (0.005, "far", True)
+
+
+def test_reconnect_snapshot_counts_fills_from_the_gap():
+    from entropy_bot.diagnostics import FillDiagnostics
+
+    diag = FillDiagnostics((COIN,))
+    old = {"coin": COIN, "side": "B", "px": "1290", "sz": "0.04", "tid": 1, "fee": "0", "closedPnl": "-9"}
+    diag.ingest_fills([old], lambda _c: None, prime=True)  # 启动快照：历史，不计
+    assert diag.run_net_pnl() == 0
+    gap = {"coin": COIN, "side": "A", "px": "1280", "sz": "0.04", "tid": 2, "crossed": True,
+           "fee": "0.1", "closedPnl": "-0.4"}
+    diag.ingest_fills([old, gap], lambda _c: None, prime=True)  # 重连快照：断线期间的成交要算
+    assert diag.run_net_pnl() == pytest.approx(-0.5)
+
+
+def test_flatten_never_leaves_a_sub_minimum_remainder(markets):
+    from entropy_bot.quoting import quote_plan
+
+    top = _top("1275.5", "1275.6", COIN)
+    # 价格涨了：$50 只够 0.0391，若只平 0.0391 会剩 0.0001（$0.13）的零头
+    plan = quote_plan(markets[COIN], top, szi=-0.0392, age_ms=16_000, notional_usd=50)
+    assert plan.intents[0].sz == pytest.approx(0.0392)
+    # 剩余部分仍 >= $10：照旧按单边金额分批平
+    big = quote_plan(markets[COIN], top, szi=-0.08, age_ms=16_000, notional_usd=50)
+    assert big.intents[0].sz == pytest.approx(0.0391)
