@@ -18,7 +18,7 @@ from entropy_bot.precision import (
     floor_size,
     floor_to_tick,
     round_price,
-    size_from_notional,
+    order_size,
     spread_bps,
     tick_size,
 )
@@ -243,8 +243,8 @@ def desired_quotes(
     if px is None:
         return []
     buy_px, sell_px = px
-    bid_sz = size_from_notional(notional_usd, buy_px, market.sz_decimals)
-    ask_sz = size_from_notional(notional_usd, sell_px, market.sz_decimals)
+    bid_sz = order_size(notional_usd, buy_px, market.sz_decimals)
+    ask_sz = order_size(notional_usd, sell_px, market.sz_decimals)
     if bid_sz <= 0 or ask_sz <= 0:
         return []
     return [
@@ -320,8 +320,8 @@ def quote_plan(
         buy_px = sell_px = None
         if px is not None:
             buy_px, sell_px = px
-            buy_sz = size_from_notional(notional_usd, buy_px, market.sz_decimals)
-            sell_sz = size_from_notional(notional_usd, sell_px, market.sz_decimals)
+            buy_sz = order_size(notional_usd, buy_px, market.sz_decimals)
+            sell_sz = order_size(notional_usd, sell_px, market.sz_decimals)
             if buy_sz > 0:
                 intents.append(
                     QuoteIntent(market.coin, market.asset_id, True, buy_px, buy_sz, "B", "Alo", False, "flat")
@@ -346,7 +346,7 @@ def quote_plan(
             if sell_raw_c is None:
                 return QuotePlan(market.coin, "long", stage, tif, take, [], age_ms, szi)
             sell_raw = sell_raw_c
-        notional_sz = size_from_notional(notional_usd, sell_raw, market.sz_decimals)
+        notional_sz = order_size(notional_usd, sell_raw, market.sz_decimals)
         sz = flatten_size(abs(szi), notional_sz, market.sz_decimals)
         if sz > 0:
             sell_px = sell_raw
@@ -360,7 +360,7 @@ def quote_plan(
         if buy_raw_c is None:
             return QuotePlan(market.coin, "short", stage, tif, take, [], age_ms, szi)
         buy_raw = buy_raw_c
-    notional_sz = size_from_notional(notional_usd, buy_raw, market.sz_decimals)
+    notional_sz = order_size(notional_usd, buy_raw, market.sz_decimals)
     sz = flatten_size(abs(szi), notional_sz, market.sz_decimals)
     if sz > 0:
         buy_px = buy_raw

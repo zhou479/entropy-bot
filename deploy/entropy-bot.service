@@ -15,9 +15,11 @@ Type=simple
 User=entropy
 WorkingDirectory=/home/entropy/entropy-bot
 ExecStart=/home/entropy/entropy-bot/.venv/bin/python -m entropy_bot live
-# SIGTERM → clean stop: cancel rests, clear the dead-man.
+# SIGTERM → clean stop: opening quotes off, reduce-only IOC the position flat
+# (STOP_FLATTEN_S, default 30s), cancel rests, verify flat, clear the dead-man.
+# Must stay longer than STOP_FLATTEN_S, or systemd SIGKILLs mid-flatten.
 KillSignal=SIGTERM
-TimeoutStopSec=30
+TimeoutStopSec=90
 Restart=on-failure
 RestartSec=15
 Environment=PYTHONUNBUFFERED=1

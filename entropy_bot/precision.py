@@ -11,6 +11,9 @@ from decimal import Decimal, ROUND_CEILING, ROUND_DOWN
 
 MAX_DECIMALS_PERP = 6
 SIG_FIGS = 5
+# Hyperliquid rejects any order below $10 ("Order must have minimum value of
+# $10"), except a reduce-only order that closes the whole position.
+MIN_NOTIONAL_USD = 10.0
 
 
 def max_price_decimals(sz_decimals: int) -> int:
@@ -68,6 +71,22 @@ def size_from_notional(notional_usd: float, price: float, sz_decimals: int) -> f
     if price <= 0:
         raise ValueError("price must be positive")
     return floor_size(notional_usd / price, sz_decimals)
+
+
+def order_size(notional_usd: float, price: float, sz_decimals: int) -> float:
+    """Size for ~`notional_usd`, never below the $10 exchange minimum at `price`.
+
+    Flooring $10 / price lands just under $10 (e.g. 0.0077 @ 1293.8 = $9.96),
+    which the exchange rejects on every attempt. Round that case up one lot.
+    """
+    if price <= 0:
+        raise ValueError("price must be positive")
+    sz = floor_size(notional_usd / price, sz_decimals)
+    if sz * price < MIN_NOTIONAL_USD - 1e-9:
+        quant = Decimal(10) ** -int(sz_decimals)
+        need = (Decimal(str(MIN_NOTIONAL_USD)) / Decimal(str(price))).quantize(quant, rounding=ROUND_CEILING)
+        sz = float(need)
+    return sz
 
 
 def spread_bps(bid: float, ask: float) -> float | None:

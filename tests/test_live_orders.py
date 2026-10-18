@@ -10,6 +10,7 @@ from entropy_bot.diagnostics import utc_day
 from entropy_bot.errors import ExchangeUncertain
 from entropy_bot.live import (
     LiveQuoter,
+    foreign_open_orders,
     RestSlot,
     reconcile_open_orders,
     slot_verdict,
@@ -277,11 +278,15 @@ def test_reconcile_keeps_known_drops_gone_adopts_bot_and_flags_foreign(markets):
         {"coin": SNDK, "oid": 11, "side": "B", "limitPx": "1293.8", "sz": "0.02"},
         {"coin": SNDK, "oid": 20, "side": "A", "limitPx": "1294.0", "sz": "0.04", "cloid": "0x45424f54aa"},
         {"coin": SNDK, "oid": 21, "side": "A", "limitPx": "1294.1", "sz": "0.04", "cloid": "0xdead"},
+        {"coin": SNDK, "oid": 22, "side": "A", "limitPx": "1294.2", "sz": "0.04", "cloid": "0x45424f54bb"},
+        {"coin": SNDK, "oid": 23, "side": "A", "limitPx": "1200.0", "sz": "0.04", "isTrigger": True},
     ]
     out, extras = reconcile_open_orders(rests, opens, {SNDK: markets[SNDK]}, now=100.0)
     assert out[SNDK]["B"].oid == 11 and out[SNDK]["B"].sz == 0.02 and out[SNDK]["B"].stage == "flat"
     assert out[SNDK]["A"].oid == 20 and out[SNDK]["A"].stage == "adopted"
-    assert extras[SNDK] == [21]
+    # Second bot order on the ask is canceled; manual order and TP/SL trigger are not.
+    assert extras[SNDK] == [22]
+    assert [o["oid"] for o in foreign_open_orders(opens, {SNDK: markets[SNDK]}, {11})] == [21, 23]
 
 
 def test_reconcile_grace_keeps_fresh_rest(markets):

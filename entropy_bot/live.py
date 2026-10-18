@@ -32,6 +32,7 @@ from entropy_bot.config import Settings, live_notional, max_position_usd, requir
 from entropy_bot.diagnostics import BookSnap, FillDiagnostics, snap_from_top
 from entropy_bot.errors import (
     ExchangeUncertain,
+    LiveGuardError,
     RateLimited,
     RequestWeightLimited,
     is_weight_limit_error,
@@ -91,6 +92,12 @@ IOC_GAP_MAX_S = 5.0
 WEIGHT_LIMITED_GAP_S = 10.0  # Hyperliquid: one request per 10s while address-limited
 WEIGHT_BACKOFF_FLOOR_S = 30.0
 ALO_REJECT_RETRY_S = 2.0
+# Any other per-order reject (margin, min size, …): 2s, 4s, … up to 60s per side,
+# so a reject that repeats every attempt cannot burn the request budget.
+ORDER_REJECT_BASE_S = 2.0
+ORDER_REJECT_MAX_S = 60.0
+POS_FRESH_S = 3.0  # inventory older than this does not count as "confirmed flat"
+STOP_POLL_S = 0.5
 BUDGET_SLOW_MULT = 4  # headroom < reserve * this → slow down reprices
 BUDGET_SLOW_FACTOR = 3.0
 ORACLE_STALE_S = 30.0
@@ -214,8 +221,11 @@ def reconcile_open_orders(
     - Cached rests still on the book keep their stage / placed_at.
     - Cached rests gone from the book (filled / canceled) are cleared, unless
       younger than `grace_s` (info can trail a fresh placement).
-    - An unknown order fills an empty slot (stage "adopted", so the next requote
-      replaces it on purpose); anything else on a traded coin is an extra to cancel.
+    - An unknown *bot* order (EBOT cloid, e.g. from a previous run) fills an
+      empty slot (stage "adopted", so the next requote replaces it on purpose);
+      a second one on the same side is an extra to cancel.
+    - Orders without a bot cloid (your manual orders, TP/SL triggers) are never
+      touched; `foreign_open_orders` lists them for a warning.
     """
     by_coin: dict[str, list[dict[str, Any]]] = {coin: [] for coin in markets}
     for order in opens:
@@ -228,6 +238,8 @@ def reconcile_open_orders(
         claimed: set[int] = set()
         parsed: list[tuple[int, str, dict[str, Any]]] = []
         for order in orders:
+            if order.get("isTrigger"):
+                continue
             try:
                 oid = as_oid(order.get("oid", order.get("o")))
             except ValueError:
@@ -263,7 +275,9 @@ def reconcile_open_orders(
                 continue
             slot = out[coin][side]
             cloid = order.get("cloid") or order.get("cloidStr")
-            if not slot.occupied() and is_bot_cloid(cloid if isinstance(cloid, str) else None):
+            if not is_bot_cloid(cloid if isinstance(cloid, str) else None):
+                continue  # not ours: leave it alone
+            if not slot.occupied():
                 out[coin][side] = RestSlot(
                     oid=oid,
                     cloid=cloid,
@@ -278,6 +292,24 @@ def reconcile_open_orders(
             else:
                 extras[coin].append(oid)
     return out, extras
+
+
+def foreign_open_orders(
+    opens: list[dict[str, Any]],
+    markets: dict[str, Market],
+    known_oids: set[int] | frozenset[int] = frozenset(),
+) -> list[dict[str, Any]]:
+    """Open orders on traded coins that this bot did not place."""
+    out = []
+    for order in opens:
+        if match_order_coin(order, markets) is None:
+            continue
+        if order.get("oid") in known_oids:
+            continue
+        cloid = order.get("cloid") or order.get("cloidStr")
+        if order.get("isTrigger") or not is_bot_cloid(cloid if isinstance(cloid, str) else None):
+            out.append(order)
+    return out
 
 
 def list_cached_oids(
@@ -456,6 +488,10 @@ class LiveQuoter:
     _pos_dirty: bool = False
     _take_misses: dict[str, int] = field(default_factory=dict)
     _reject_until: dict[tuple[str, str], float] = field(default_factory=dict)
+    _reject_streak: dict[tuple[str, str], int] = field(default_factory=dict)
+    last_pos_ok: float = 0.0
+    stopping: bool = False
+    _foreign_seen: int = 0
     _needs_reconcile: dict[str, bool] = field(default_factory=dict)
     _replace_skip_logged: dict[str, bool] = field(default_factory=dict)
     _block_logged: dict[str, str | None] = field(default_factory=dict)
@@ -759,6 +795,7 @@ class LiveQuoter:
             log.warning("clearinghouseState null/429; keeping inventory cache")
             return
         self._pos_dirty = False
+        self.last_pos_ok = now
         for coin, szi in parsed.items():
             if abs(szi - self.pos.get(coin, 0.0)) > EPS:
                 self._take_misses[coin] = 0
@@ -823,6 +860,8 @@ class LiveQuoter:
 
     def opening_block(self, coin: str, top: BookTop) -> str | None:
         """Reason not to hold *any* opening (flat) quote. Opening rests get canceled."""
+        if self.stopping:
+            return "stopping"
         if coin in self.settings.rth_only_coins and not is_rth():
             return "outside NYSE regular hours (RTH_ONLY_COINS)"
         limit = self.settings.max_daily_loss_usd
@@ -899,6 +938,14 @@ class LiveQuoter:
             self.extra_oids[coin] = []
         return True
 
+    def _note_reject(self, coin: str, side: str, now: float) -> float:
+        key = (coin, side)
+        streak = self._reject_streak.get(key, 0)
+        wait = min(ORDER_REJECT_MAX_S, ORDER_REJECT_BASE_S * (2**streak))
+        self._reject_streak[key] = streak + 1
+        self._reject_until[key] = max(self._reject_until.get(key, 0.0), now + wait)
+        return wait
+
     def _place(self, coin: str, intents: list[QuoteIntent], plan: QuotePlan) -> dict[str, Any] | None:
         if not intents:
             return None
@@ -939,6 +986,9 @@ class LiveQuoter:
                 log.warning("ALO px rejected, will requote %s %s", coin, resp)
                 return {"aloReject": True, "resp": resp}
             log.warning("%s not ok %s %s", "IOC flatten" if plan.take else "order", coin, resp)
+            if not plan.take:
+                for intent in pending:
+                    self._note_reject(coin, intent.side, now)
             return {"iocFail": plan.take, "resp": resp}
         statuses = resp_statuses(resp)
         accepted = 0
@@ -956,8 +1006,10 @@ class LiveQuoter:
                     log.warning("ALO px rejected, will requote %s %s %s", coin, intent.side, err)
                     out["aloReject"] = True
                 else:
-                    log.warning("order status %s %s %s", coin, intent.side, err)
+                    wait = self._note_reject(coin, intent.side, now)
+                    log.warning("order status %s %s %s (retry that side in %.0fs)", coin, intent.side, err, wait)
                 continue
+            self._reject_streak.pop((coin, intent.side), None)
             if plan.take or intent.tif.lower() == "ioc":
                 filled += 1  # IOC never rests
                 continue
@@ -1051,6 +1103,17 @@ class LiveQuoter:
             log.warning("frontendOpenOrders null/429; keeping rest cache")
             return False
         self.rests, extras = reconcile_open_orders(self.rests, opens, self.markets, now=now)
+        known = {slot.oid for sides in self.rests.values() for slot in sides.values() if slot.oid is not None}
+        foreign = len(foreign_open_orders(opens, self.markets, known))
+        if foreign != self._foreign_seen:
+            if foreign:
+                log.warning(
+                    "%s open order(s) on %s were not placed by this bot (manual / TP-SL); "
+                    "left untouched. The dead-man and a fill can still interact with them.",
+                    foreign,
+                    ",".join(self.markets),
+                )
+            self._foreign_seen = foreign
         for coin in self.markets:
             self.extra_oids[coin] = extras.get(coin, [])
             if self.extra_oids[coin]:
@@ -1211,8 +1274,89 @@ class LiveQuoter:
             except Exception as exc:  # noqa: BLE001
                 log.warning("live step %s: %s", coin, exc)
 
-    def shutdown_cancels(self) -> None:
-        """Cancel every rest on this bot's coins, then clear (or shorten) the dead-man."""
+    def _exit_plan(self, coin: str, top: BookTop, szi: float) -> QuotePlan:
+        """Reduce-only IOC for the *whole* position (an exact close is exempt from the $10 minimum)."""
+        px = max(top.ask or 0.0, top.bid or 0.0, top.mid or 0.0)
+        return quote_plan(
+            self.markets[coin],
+            top,
+            szi=szi,
+            age_ms=FLAT_TAKE_MS,
+            notional_usd=abs(szi) * px * 2 + 1.0,
+            take_slippage_ticks=self.settings.take_slippage_ticks,
+        )
+
+    def position_confirmed(self) -> bool:
+        return time.time() - self.last_pos_ok <= POS_FRESH_S
+
+    def open_positions(self) -> dict[str, float]:
+        return {coin: szi for coin, szi in self.pos.items() if abs(szi) > EPS}
+
+    def flatten_on_stop(
+        self,
+        feed: BookFeed | None,
+        *,
+        timeout_s: float,
+        stop: dict[str, Any] | None = None,
+        deadman: bool = True,
+    ) -> bool:
+        """Opening quotes off; reduce-only IOC every open position until flat.
+
+        True only when a fresh clearinghouseState shows no position. Gives up
+        after `timeout_s` or on a second stop signal.
+        """
+        self.stopping = True
+        deadline = time.time() + timeout_s
+        announced = False
+        while True:
+            if stop is not None and stop.get("count", 0) > 1:
+                log.error("STOP second signal: flatten aborted")
+                return False
+            self.drain_events()
+            if deadman:
+                self.maybe_deadman()
+            try:
+                self.refresh_positions(force=True)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("stop: position poll: %s", exc)
+            open_pos = self.open_positions()
+            if self.position_confirmed() and not open_pos:
+                if announced:
+                    log.info("STOP flatten done: no open position")
+                return True
+            if time.time() >= deadline:
+                return False
+            if open_pos and not announced:
+                log.warning(
+                    "STOP: opening quotes off; reduce-only IOC flatten %s (up to %.0fs; "
+                    "send the stop signal again to skip)",
+                    open_pos,
+                    timeout_s,
+                )
+                announced = True
+            for coin in self.markets:
+                try:
+                    szi = self.pos.get(coin, 0.0)
+                    if abs(szi) <= EPS:
+                        sides = [s for s in ("B", "A") if side_occupied(self.rests, coin, s)]
+                        extras = list(self.extra_oids.get(coin, []))
+                        if sides or extras:
+                            self._cancel(coin, sides, extras)
+                        continue
+                    top = self.book_for(coin, feed)
+                    if top is None or top.bid is None or top.ask is None:
+                        log.warning("stop: no book for %s; cannot flatten yet", coin)
+                        continue
+                    self._take(coin, self._exit_plan(coin, top, szi))
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("stop flatten %s: %s", coin, exc)
+            self.wait_for_book(STOP_POLL_S)
+
+    def shutdown_cancels(self) -> bool:
+        """Cancel every rest on this bot's coins, then clear (or shorten) the dead-man.
+
+        Returns True when every cancel was confirmed and the dead-man cleared.
+        """
         clean = True
         self.drain_events()
         if not self.reconcile(force=True):
@@ -1224,11 +1368,12 @@ class LiveQuoter:
                 clean = False
         if clean:
             self.clear_deadman()
-            return
+            return True
         try:
             self.schedule_deadman(DEADMAN_FALLBACK_MS)
         except Exception as exc:  # noqa: BLE001
             log.warning("shutdown dead-man fallback: %s", exc)
+        return False
 
 
 def _log_agent(client: InfoClient, signer: LiveSigner) -> None:
@@ -1286,12 +1431,63 @@ def log_startup(settings: Settings, markets: dict[str, Market]) -> None:
         log.info("%s asset=%s maxLev(meta)=%s szDecimals=%s", coin, market.asset_id, market.max_leverage, market.sz_decimals)
 
 
+def stop_cleanly(
+    quoter: LiveQuoter,
+    feed: BookFeed | None,
+    settings: Settings,
+    stop: dict[str, Any] | None,
+) -> int:
+    """Flatten (unless STOP_FLATTEN_S=0), cancel, clear the dead-man, then verify.
+
+    0 = confirmed flat with no bot orders. 3 = needs a manual look; the log says why.
+    Cancel alone is not flatten: an open position is reported, never ignored.
+    """
+    quoter.stopping = True
+    if settings.stop_flatten_s > 0:
+        try:
+            quoter.flatten_on_stop(feed, timeout_s=settings.stop_flatten_s, stop=stop)
+        except Exception as exc:  # noqa: BLE001
+            log.error("stop flatten failed: %s", exc)
+    if feed is not None:
+        feed.stop()
+    try:
+        quoter.flush_markouts()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("fill-diag shutdown flush: %s", exc)
+    try:
+        orders_clean = quoter.shutdown_cancels()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("shutdown: %s", exc)
+        orders_clean = False
+    try:
+        quoter.refresh_positions(force=True)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("final position check: %s", exc)
+    left = quoter.open_positions()
+    if not quoter.position_confirmed():
+        log.error("STOP NOT VERIFIED: could not read the position (cached %s); check the account manually", left)
+        return 3
+    if left:
+        log.error(
+            "STOP NOT FLAT: open position %s left on the account (%s). Close it on the site or run "
+            "`python -m entropy_bot flatten`.",
+            left,
+            "STOP_FLATTEN_S=0" if settings.stop_flatten_s <= 0 else "flatten timed out / aborted",
+        )
+        return 3
+    if not orders_clean:
+        log.error("STOP: flat, but order cleanup unconfirmed; dead-man left armed (+6s). Check open orders.")
+        return 3
+    log.info("STOP clean: flat, no bot orders, dead-man cleared")
+    return 0
+
+
 def run_quoter(
     quoter: LiveQuoter,
     feed: BookFeed,
     *,
     seconds: float | None,
-    stop: dict[str, bool],
+    stop: dict[str, Any],
 ) -> int:
     feed.start()
     if not feed.wait_ready():
@@ -1311,23 +1507,90 @@ def run_quoter(
     return 0
 
 
-def install_stop_handlers() -> dict[str, bool]:
-    stop = {"flag": False}
+def install_stop_handlers() -> dict[str, Any]:
+    """First SIGINT/SIGTERM: stop and flatten. Second: skip the flatten wait."""
+    stop: dict[str, Any] = {"flag": False, "count": 0}
 
     def _handle(_signum: int, _frame: object) -> None:
+        stop["count"] += 1
         stop["flag"] = True
+        if stop["count"] == 1:
+            log.warning("stop requested: opening quotes off; closing out before exit (again = skip the flatten wait)")
+        else:
+            log.error("second stop signal: skipping flatten; position may be left open")
 
     signal.signal(signal.SIGINT, _handle)
     signal.signal(signal.SIGTERM, _handle)
     return stop
 
 
+CLOCK_SKEW_WARN_MS = 2_000
+CLOCK_SKEW_MAX_MS = 15_000  # dead-man deadlines are absolute; refuse a badly skewed clock
+
+
+def acquire_instance_lock(account: str) -> Any:
+    """One live/flatten process per master account (two would fight over the same rests)."""
+    import fcntl
+    import os
+    import tempfile
+
+    path = os.path.join(tempfile.gettempdir(), f"entropy-bot-{account.lower()}.lock")
+    handle = open(path, "w")  # noqa: SIM115 - held for the life of the process
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        handle.close()
+        raise LiveGuardError(f"another entropy-bot is already trading {account} (lock {path})") from exc
+    handle.write(str(os.getpid()))
+    handle.flush()
+    return handle
+
+
+def check_signer_role(client: InfoClient, signer: LiveSigner) -> None:
+    """Refuse a key/account mix-up: the bot would read one account and trade another."""
+    data = client.post_info({"type": "userRole", "user": signer.signer_address}, optional=True)
+    role = data.get("role") if isinstance(data, dict) else None
+    if role is None:
+        log.warning("userRole unavailable; cannot verify signer %s -> account %s", signer.signer_address, signer.account)
+        return
+    if role == "agent":
+        master = str(((data.get("data") or {}).get("user")) or "")
+        if master and master.lower() != signer.account.lower():
+            raise LiveGuardError(
+                f"signing key {signer.signer_address} is an agent of {master}, but the bot would read "
+                f"positions of {signer.account}. Set HYPERLIQUID_ACCOUNT={master}."
+            )
+        return
+    if signer.is_agent:
+        raise LiveGuardError(
+            f"HYPERLIQUID_ACCOUNT={signer.account} but the key {signer.signer_address} is not an approved "
+            f"agent (userRole={role!r}); orders would hit the key's own account. Approve the agent first."
+        )
+
+
+def check_clock(client: InfoClient, coin: str) -> None:
+    try:
+        book = client.l2_book(coin)
+        server_ms = int(book.get("time"))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("clock check skipped: %s", exc)
+        return
+    skew = int(time.time() * 1000) - server_ms
+    if abs(skew) > CLOCK_SKEW_MAX_MS:
+        raise LiveGuardError(f"local clock is {skew / 1000:+.1f}s off Hyperliquid; fix NTP before trading")
+    if abs(skew) > CLOCK_SKEW_WARN_MS:
+        log.warning("local clock is %+.1fs off Hyperliquid (dead-man uses absolute times); check NTP", skew / 1000)
+
+
 def run_live(settings: Settings, *, seconds: float | None = None) -> int:
     require_live(settings)
     signer = LiveSigner(settings.private_key or "", settings.account)
+    lock = acquire_instance_lock(signer.account)
     client = InfoClient(settings.api_url, pause_s=0.0)
     feed: BookFeed | None = None
     quoter: LiveQuoter | None = None
+    stop: dict[str, Any] | None = None
+    rc = 1
     try:
         _meta, markets, _ctxs = load_io_markets(client, settings.coins)
         dex = perp_dex_info(client.perp_dexs(), ALLOWED_DEX)
@@ -1344,6 +1607,8 @@ def run_live(settings: Settings, *, seconds: float | None = None) -> int:
             ENTROPY_BUILDER,
         )
         log_startup(settings, markets)
+        check_signer_role(client, signer)
+        check_clock(client, settings.coins[0])
         _log_agent(client, signer)
         user_state = client.clearinghouse_state(signer.account, ALLOWED_DEX, optional=True)
         if user_state:
@@ -1354,8 +1619,15 @@ def run_live(settings: Settings, *, seconds: float | None = None) -> int:
             if parsed is not None:
                 quoter.pos = parsed
                 quoter.pos_since = sync_pos_since({}, parsed, quoter.pos_since, time.time())
-        quoter.bootstrap_isolated()
+                quoter.last_pos_ok = time.time()
+                if quoter.open_positions():
+                    log.warning("starting with open position %s; flatten ladder runs first", quoter.open_positions())
         stop = install_stop_handlers()
+        try:
+            quoter.bootstrap_isolated()
+        except Exception as exc:  # noqa: BLE001
+            # Leverage is already isolated on HIP-3; a weight-limited start must not crash-loop.
+            log.warning("isolated leverage update failed (continuing): %s", exc)
         quoter.poll_budget(force=True)
         quoter.poll_user_fills(force=True)
         # Adopt or cancel whatever a previous run left on the book.
@@ -1370,17 +1642,13 @@ def run_live(settings: Settings, *, seconds: float | None = None) -> int:
             on_asset_ctx=quoter.on_asset_ctx,
         )
         quoter._feed = feed
-        return run_quoter(quoter, feed, seconds=seconds, stop=stop)
+        rc = run_quoter(quoter, feed, seconds=seconds, stop=stop)
     finally:
-        if feed is not None:
-            feed.stop()
         if quoter is not None:
-            try:
-                quoter.flush_markouts()
-            except Exception as exc:  # noqa: BLE001
-                log.warning("fill-diag shutdown flush: %s", exc)
-            try:
-                quoter.shutdown_cancels()
-            except Exception as exc:  # noqa: BLE001
-                log.warning("shutdown: %s", exc)
+            stop_rc = stop_cleanly(quoter, feed, settings, stop)
+            rc = rc or stop_rc
+        elif feed is not None:
+            feed.stop()
         client.close()
+        lock.close()
+    return rc

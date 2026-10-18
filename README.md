@@ -44,7 +44,7 @@ Per coin: at most **1 buy + 1 sell**. Isolated-only. Builder = Entropy `0xcD254d
 
 ALO / Bad Alo Px / post-only reject: log, cool that side down 2s, requote; the loop does not stop. A price-only change is **throttled** by `MIN_REPLACE_S` (default 12s) per coin. A stage / TIF / reduce-only change (e.g. a fill flips flat → long) is **not** throttled: the opening side is canceled at once so the bot never adds to a position. A requote only ever touches **its own coin**. Cancels go out by oid (by cloid only when no oid is known) — never both. Never place a side that already has an oid/cloid. HIP-3 oids exceed int32 — they are never truncated.
 
-The rest cache follows the WS `orderUpdates` + `userFills` streams and is cross-checked against `frontendOpenOrders` (`dex:"io"`) every 20s. Unknown bot orders are adopted, anything else on a traded coin is canceled. An `/exchange` timeout marks the coin "unknown": nothing new is placed there until a reconcile succeeds.
+The rest cache follows the WS `orderUpdates` + `userFills` streams and is cross-checked against `frontendOpenOrders` (`dex:"io"`) every 20s. Unknown bot orders (EBOT cloid, e.g. from a previous run) are adopted; orders the bot did not place — your manual orders and TP/SL triggers — are never canceled (a warning is logged). An `/exchange` timeout marks the coin "unknown": nothing new is placed there until a reconcile succeeds.
 
 ### Request weight / write throttle
 
@@ -87,7 +87,27 @@ Fills come from the official `userFills` WS on the same connection (snapshot ign
 
 While `live` is running the bot sends `scheduleCancel` at **now+`DEADMAN_AHEAD_S`** (default 60s) and renews **only when a third of it is left** (default <20s) — about 90 writes/hour instead of ~300 at +20s/<8s. Official minimum is 5s. On 429 it falls back to **+6s**. A failed renew (request weight, or Hyperliquid's **10 triggers per UTC day** cap) is retried every 10s and pauses new opening quotes until it arms again.
 
-**This is account-wide.** When the timer fires, Hyperliquid cancels **all** open orders on the master account — not just `io:ANTH` / `io:SNDK`.
+**This is account-wide.** When the timer fires, Hyperliquid cancels **all** open orders on the master account — not just `io:ANTH` / `io:SNDK`. It **only cancels orders; it never closes a position.**
+
+### Stopping: flatten, then verify
+
+On Ctrl-C, SIGTERM (`systemctl stop`) or the end of `--seconds`:
+
+1. Opening quotes off and canceled.
+2. Every open position is closed with a reduce-only IOC for the **whole** size (an exact close is exempt from the $10 minimum), crossing `TAKE_SLIPPAGE_TICKS`, retried until flat or `STOP_FLATTEN_S` (default 30s). The dead-man keeps renewing meanwhile.
+3. Remaining bot orders canceled, then a **fresh** `clearinghouseState` must show no position.
+4. Only then the dead-man is cleared and the process exits 0 (`STOP clean: flat, no bot orders, dead-man cleared`).
+
+If the position could not be closed or read, the log says `STOP NOT FLAT` / `STOP NOT VERIFIED` and the process exits **3**. A second Ctrl-C skips the flatten wait (still cancels). `STOP_FLATTEN_S=0` keeps the old cancel-only stop, but an open position is still reported and exits 3.
+
+A hard kill (`kill -9`, OOM, power loss) cannot flatten: the dead-man cancels orders after `DEADMAN_AHEAD_S`, and the next start sees the position and runs the flatten ladder first. `python -m entropy_bot flatten` closes everything by hand (same exit path, up to 60s, exit 0 only when verified flat).
+
+### Startup guards
+
+- `userRole` of the signing key must match `HYPERLIQUID_ACCOUNT` (an agent key without the right master, or a non-agent key with a different account, is refused — the bot would read one account and trade another).
+- Local clock more than 15s off Hyperliquid is refused (>2s warns); dead-man deadlines are absolute.
+- One `live` / `flatten` process per master account (lock file in the temp dir).
+- Orders are sized to at least $10 (the exchange minimum); any other per-order reject (margin, size, …) backs that side off 2s → 4s → … 60s instead of retrying every loop.
 
 On a clean stop the bot sends `scheduleCancel` **without** `time` (clears the timer) after cancelling its rests. If info is rate-limited it leaves a +6s cancel instead of assuming the book is empty.
 
@@ -137,7 +157,8 @@ python -m entropy_bot paper           # full live logic vs simulated exchange, n
 python -m entropy_bot paper --seconds 600
 RTH_ONLY_COINS= python -m entropy_bot paper --seconds 600   # try SNDK outside NYSE hours
 python -m entropy_bot live            # refuses unless LIVE=1 and a key
-python -m entropy_bot cancel          # cancel this bot's cloIDs (needs key)
+python -m entropy_bot cancel          # cancel this bot's cloIDs (needs key) — does NOT close positions
+python -m entropy_bot flatten         # emergency: cancel bot orders + reduce-only IOC every position flat (needs key)
 ```
 
 `status` prints io meta, books, Entropy Partner T4, self rebate, growth mode, default TIF and (with `HYPERLIQUID_ACCOUNT`) the address request budget — no key required.
@@ -170,7 +191,7 @@ python -m entropy_bot live
 # the dead-man (+60s, account-wide) covers a hard kill
 ```
 
-If the process dies without a clean stop, `scheduleCancel` fires and cancels **every** resting order on that master.
+Ctrl-C (or `systemctl stop`) closes the position before exiting; check the last line is `STOP clean`. If the process dies without a clean stop, `scheduleCancel` fires and cancels **every** resting order on that master — the position stays open until the bot restarts or you run `flatten`.
 
 ### Config (env / `.env`)
 
@@ -190,6 +211,7 @@ If the process dies without a clean stop, `scheduleCancel` fires and cancels **e
 | `MAX_POSITION_USD` | 3 × notional | Position notional that goes straight to IOC |
 | `MAX_DAILY_LOSS_USD` | `0` | Stop opening quotes for the UTC day below −N realized net PnL. `0` = off |
 | `REQUEST_BUDGET_RESERVE` | `500` | Headroom below which no new opening quotes go out |
+| `STOP_FLATTEN_S` | `30` | On stop, reduce-only IOC the position flat for up to N s, then verify. `0` = cancel only (still reported) |
 | `QUOTE_NOTIONAL_USD` | `50` | Notional per side (live and paper), ≥ $10 |
 | `QUOTE_OFFSET_TICKS` | `2` | Legacy. Live ignores it |
 | `MAX_LEVERAGE` | `2` | Capped at each market's live meta max (currently ANTH 6 / SNDK 15) |
@@ -242,7 +264,11 @@ DEX 名是 **`io`**。不要用 `xyz` 或 `vntl`。
 
 风控闸门（只停开仓单，有仓照样平）：`RTH_ONLY_COINS`（默认 SNDK，只在纽约 RTH 开仓，含 NYSE 节假日和 13:00 提前收盘，日历在 `entropy_bot/session.py`，每年需补充）；`ORACLE_MAX_DEV_BPS`（默认 50bp，盘口 mid 偏离 oracle 过大）；`MAX_DAILY_LOSS_USD`（默认关闭，按 UTC 日的已实现 `closedPnl − fee`）；dead-man 未成功设置时也不挂新开仓单。
 
-挂单缓存跟随 WS `orderUpdates` / `userFills` 实时更新，每 20 秒用 `frontendOpenOrders` 对账；下单超时视为状态未知，对账成功前该币不再下新单。
+挂单缓存跟随 WS `orderUpdates` / `userFills` 实时更新，每 20 秒用 `frontendOpenOrders` 对账；下单超时视为状态未知，对账成功前该币不再下新单。不是本机器人下的单（你手动挂的单、止盈止损触发单）**一律不撤**，只打警告。
+
+下单数量保证 ≥ $10（交易所最低额，向下取整不够时进一个最小单位）；其它拒单（保证金不足等）按侧退避 2s → 4s → … 最长 60s，不会每轮重试烧额度。
+
+启动检查：签名私钥的 `userRole` 必须和 `HYPERLIQUID_ACCOUNT` 对得上（否则会出现"查 A 账户的仓位、在 B 账户下单"）；本机时钟偏差 > 15 秒拒绝启动；同一主账户只允许一个 `live`/`flatten` 进程。
 
 Tick 从盘口买卖价增量推断，不用 `tick_size(mid)`。
 
@@ -254,7 +280,20 @@ Tick 从盘口买卖价增量推断，不用 `tick_size(mid)`。
 
 ### Dead-man（账户级）
 
-运行中把 `scheduleCancel` 设到 **现在+`DEADMAN_AHEAD_S`**（默认 60 秒），剩余不到三分之一（默认 <20 秒）才续期，每小时约 90 次写（原先 +20s/<8s 约 300 次）。官方最短 5s；429 则 +6s。续期失败（权重耗尽，或官方**每 UTC 日最多触发 10 次**）每 10 秒重试一次，期间不挂新开仓单。到点后会撤销该主账户上的**全部**挂单，不限于本机器人的币。干净退出时发送不带 `time` 的 `scheduleCancel` 以清除定时。
+运行中把 `scheduleCancel` 设到 **现在+`DEADMAN_AHEAD_S`**（默认 60 秒），剩余不到三分之一（默认 <20 秒）才续期，每小时约 90 次写（原先 +20s/<8s 约 300 次）。官方最短 5s；429 则 +6s。续期失败（权重耗尽，或官方**每 UTC 日最多触发 10 次**）每 10 秒重试一次，期间不挂新开仓单。到点后会撤销该主账户上的**全部**挂单，不限于本机器人的币。**dead-man 只撤单，不平仓。**
+
+### 停止 = 先平仓、再核对
+
+Ctrl-C、SIGTERM（`systemctl stop`）或 `--seconds` 到时：
+
+1. 停止并撤掉开仓单；
+2. 对每个仓位发**全量** reduce-only IOC（刚好平掉整仓不受 $10 下限限制），多穿 `TAKE_SLIPPAGE_TICKS`，反复直到平掉或 `STOP_FLATTEN_S`（默认 30 秒）超时，期间 dead-man 继续续期；
+3. 撤掉剩余挂单，再用**新拉取**的 `clearinghouseState` 确认仓位为 0；
+4. 确认后才清除 dead-man，退出码 0，日志最后一行是 `STOP clean: flat, no bot orders, dead-man cleared`。
+
+平不掉或读不到仓位：日志 `STOP NOT FLAT` / `STOP NOT VERIFIED`，退出码 **3**，需要你手动处理。再按一次 Ctrl-C 会跳过等待（仍会撤单）。`STOP_FLATTEN_S=0` 恢复"只撤单"的旧行为，但有仓位仍会报错并以 3 退出。
+
+`kill -9`、OOM、断电等硬杀无法平仓：dead-man 在 `DEADMAN_AHEAD_S` 后撤单，仓位保留到下次启动（启动时发现仓位会先走平仓阶梯），或手动执行 `python -m entropy_bot flatten`。
 
 ### 命令
 
@@ -263,7 +302,8 @@ python -m entropy_bot status   # 公共行情，不需要私钥（设了 HYPERLI
 python -m entropy_bot paper    # 与实盘同一套逻辑 + 模拟撮合，不签名；结束时打印成交/盈亏/写请求数汇总
 RTH_ONLY_COINS= python -m entropy_bot paper --seconds 600   # 非美股时段也想试跑 SNDK
 python -m entropy_bot live     # 实盘；缺 LIVE=1 或私钥会直接拒绝
-python -m entropy_bot cancel   # 撤销本机器人的 cloid
+python -m entropy_bot cancel   # 撤销本机器人的 cloid（不平仓）
+python -m entropy_bot flatten  # 紧急平仓：撤本机器人挂单 + reduce-only IOC 平掉所有仓位，核对为 0 才返回 0
 ```
 
 VPS：`.env` 里设 `LIVE=1`、agent 私钥、主地址；先跑 `paper --seconds 600` 看汇总，再用 tmux 或 `deploy/entropy-bot.service`（systemd）跑 `python -m entropy_bot live`。服务器时钟要同步（chrony）。进程被硬杀时靠账户级 dead-man（60 秒）撤单。

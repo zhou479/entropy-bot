@@ -37,6 +37,7 @@ DEFAULT_TAKE_SLIPPAGE_TICKS = 2
 DEFAULT_ORACLE_MAX_DEV_BPS = 50.0
 DEFAULT_MAX_POSITION_MULT = 3.0
 DEFAULT_REQUEST_BUDGET_RESERVE = 500
+DEFAULT_STOP_FLATTEN_S = 30.0
 OFFICIAL_HOST_SUFFIX = "hyperliquid.xyz"
 
 
@@ -78,6 +79,9 @@ class Settings:
     max_daily_loss_usd: float = 0.0
     # Stop new opening quotes when nRequestsCap - nRequestsUsed falls below this.
     request_budget_reserve: int = DEFAULT_REQUEST_BUDGET_RESERVE
+    # On stop: reduce-only IOC the position flat for up to this long before
+    # canceling and exiting. 0 = cancel only (position is left open).
+    stop_flatten_s: float = DEFAULT_STOP_FLATTEN_S
 
     @property
     def paper(self) -> bool:
@@ -149,6 +153,7 @@ def load_settings(dotenv_path: str | Path | None = None) -> Settings:
         max_pos = float(max_pos_raw) if max_pos_raw is not None else None
         max_loss = float(os.environ.get("MAX_DAILY_LOSS_USD", "0") or 0)
         budget_reserve = int(os.environ.get("REQUEST_BUDGET_RESERVE", DEFAULT_REQUEST_BUDGET_RESERVE))
+        stop_flatten_s = float(os.environ.get("STOP_FLATTEN_S", DEFAULT_STOP_FLATTEN_S))
     except ValueError as exc:
         raise ConfigError(f"invalid numeric config: {exc}") from exc
     if notional <= 0 or offset < 0 or max_lev < 1:
@@ -164,6 +169,8 @@ def load_settings(dotenv_path: str | Path | None = None) -> Settings:
         raise ConfigError(f"DEADMAN_AHEAD_S must be >= {MIN_DEADMAN_AHEAD_S:g}")
     if max_pos is not None and max_pos <= 0:
         raise ConfigError("MAX_POSITION_USD must be > 0 when set")
+    if stop_flatten_s < 0:
+        raise ConfigError("STOP_FLATTEN_S must be >= 0 (0 = cancel only, leave the position)")
     if max_loss < 0:
         raise ConfigError("MAX_DAILY_LOSS_USD is a positive loss limit (0 disables)")
     rates_for_tier(fee_tier)
@@ -203,6 +210,7 @@ def load_settings(dotenv_path: str | Path | None = None) -> Settings:
         max_position_usd=max_pos,
         max_daily_loss_usd=max_loss,
         request_budget_reserve=budget_reserve,
+        stop_flatten_s=stop_flatten_s,
     )
 
 

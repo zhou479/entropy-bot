@@ -31,7 +31,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Official HTTP+WS live MM (ALO + flatten ladder). Requires LIVE=1 and a key.",
     )
     live.add_argument("--seconds", type=float, default=None, help="Stop after N seconds")
-    sub.add_parser("cancel", help="Cancel resting bot cloIDs on ANTH/SNDK.")
+    sub.add_parser("cancel", help="Cancel resting bot cloIDs (does NOT close positions).")
+    sub.add_parser(
+        "flatten",
+        help="Emergency close: cancel bot orders, reduce-only IOC every position flat (needs a key).",
+    )
     return parser
 
 
@@ -57,6 +61,10 @@ def main(argv: list[str] | None = None) -> int:
             from entropy_bot.cancel import run_cancel
 
             return run_cancel(settings)
+        if args.command == "flatten":
+            from entropy_bot.flatten import run_flatten
+
+            return run_flatten(settings)
         parser.error(f"unknown command {args.command}")
         return 2
     except EntropyBotError as exc:

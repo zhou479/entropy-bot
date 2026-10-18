@@ -12,6 +12,8 @@ position, conservative for adverse selection):
   best bid up to its price), up to the touch size, at the order's price.
 - IOC fills against the live touch up to the touch size, or misses.
 - Reduce-only is clamped to the open position.
+- Orders under $10 are rejected unless they are a reduce-only exact close
+  (same rule as the exchange).
 """
 
 from __future__ import annotations
@@ -24,8 +26,9 @@ from typing import Any
 from entropy_bot.coins import ALLOWED_DEX, Market, perp_dex_info
 from entropy_bot.config import Settings
 from entropy_bot.fees import estimate_from_settings
-from entropy_bot.live import LiveQuoter, install_stop_handlers, log_startup, run_quoter
+from entropy_bot.live import LiveQuoter, install_stop_handlers, log_startup, run_quoter, stop_cleanly
 from entropy_bot.orders import LiveSigner, next_nonce
+from entropy_bot.precision import MIN_NOTIONAL_USD
 from entropy_bot.quoting import BookTop, book_top
 from entropy_bot.rest import InfoClient
 from entropy_bot.status import load_io_markets
@@ -159,11 +162,15 @@ class PaperExchange:
         sz = float(wire["s"])
         ro = bool(wire.get("r"))
         tif = str(((wire.get("t") or {}).get("limit") or {}).get("tif") or "Alo")
+        exact_close = False
         if ro:
             room = max(0.0, -self.pos[coin]) if is_buy else max(0.0, self.pos[coin])
             if room <= EPS:
                 return {"error": "Reduce only order would increase position."}
+            exact_close = sz >= room - EPS
             sz = min(sz, room)
+        if px * sz < MIN_NOTIONAL_USD - 1e-9 and not exact_close:
+            return {"error": "Order must have minimum value of $10."}
         crosses = px >= top.ask if is_buy else px <= top.bid
         oid = self._new_oid()
         if tif == "Alo":
@@ -341,6 +348,8 @@ def run_paper(settings: Settings, *, seconds: float | None = None) -> int:
     feed: BookFeed | None = None
     quoter: LiveQuoter | None = None
     paper: PaperExchange | None = None
+    stop: dict[str, Any] | None = None
+    rc = 1
     try:
         _meta, markets, _ctxs = load_io_markets(client, settings.coins)
         dex = perp_dex_info(client.perp_dexs(), ALLOWED_DEX)
@@ -355,8 +364,8 @@ def run_paper(settings: Settings, *, seconds: float | None = None) -> int:
         paper = PaperExchange(markets, client, settings)
         quoter = LiveQuoter(settings, markets, paper, PaperSigner())  # type: ignore[arg-type]
         paper.listener = quoter
-        quoter.bootstrap_isolated()
         stop = install_stop_handlers()
+        quoter.bootstrap_isolated()
 
         def on_book(coin: str, data: dict[str, Any]) -> None:
             paper.on_book(coin, data)
@@ -365,13 +374,13 @@ def run_paper(settings: Settings, *, seconds: float | None = None) -> int:
         feed = BookFeed(settings.ws_url, settings.coins, on_book, on_asset_ctx=quoter.on_asset_ctx)
         quoter._feed = feed
         log.info("paper quoting on one WS connection; Ctrl-C to stop")
-        return run_quoter(quoter, feed, seconds=seconds, stop=stop)
+        rc = run_quoter(quoter, feed, seconds=seconds, stop=stop)
     finally:
-        if feed is not None:
-            feed.stop()
         if quoter is not None:
-            quoter.flush_markouts()
-            quoter.shutdown_cancels()
+            rc = rc or stop_cleanly(quoter, feed, settings, stop)
+        elif feed is not None:
+            feed.stop()
         if paper is not None:
             log.info("%s", paper.summary())
         client.close()
+    return rc
