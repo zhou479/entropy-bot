@@ -100,13 +100,14 @@ On Ctrl-C, SIGTERM (`systemctl stop`) or the end of `--seconds`:
 
 If the position could not be closed or read, the log says `STOP NOT FLAT` / `STOP NOT VERIFIED` and the process exits **3**. A second Ctrl-C skips the flatten wait (still cancels). `STOP_FLATTEN_S=0` keeps the old cancel-only stop, but an open position is still reported and exits 3.
 
-A hard kill (`kill -9`, OOM, power loss) cannot flatten: the dead-man cancels orders after `DEADMAN_AHEAD_S`, and the next start sees the position and runs the flatten ladder first. `python -m entropy_bot flatten` closes everything by hand (same exit path, up to 60s, exit 0 only when verified flat).
+A hard kill (`kill -9`, OOM, power loss) cannot flatten: the dead-man cancels orders after `DEADMAN_AHEAD_S`, and the next start sees the position and runs the flatten ladder first. `python -m entropy_bot flatten` closes everything by hand on **every** supported coin (io:ANTH and io:SNDK, regardless of `COINS`): same exit path, up to 60s, exit 0 only when verified flat and every bot order is confirmed canceled. Stop the live bot first — the account lock refuses a second process.
 
 ### Startup guards
 
 - `userRole` of the signing key must match `HYPERLIQUID_ACCOUNT` (an agent key without the right master, or a non-agent key with a different account, is refused — the bot would read one account and trade another).
 - Local clock more than 15s off Hyperliquid is refused (>2s warns); dead-man deadlines are absolute.
-- One `live` / `flatten` process per master account (lock file in the temp dir).
+- One `live` / `flatten` process per master account (lock file in `~/.cache/entropy-bot/`, or `ENTROPY_BOT_LOCK_DIR`; not `/tmp`, which systemd's `PrivateTmp` hides). Run `flatten` as the same user as the service.
+- Open positions on supported coins outside `COINS` are logged at start (not managed by that run).
 - Orders are sized to at least $10 (the exchange minimum); any other per-order reject (margin, size, …) backs that side off 2s → 4s → … 60s instead of retrying every loop.
 
 On a clean stop the bot sends `scheduleCancel` **without** `time` (clears the timer) after cancelling its rests. If info is rate-limited it leaves a +6s cancel instead of assuming the book is empty.
@@ -268,7 +269,7 @@ DEX 名是 **`io`**。不要用 `xyz` 或 `vntl`。
 
 下单数量保证 ≥ $10（交易所最低额，向下取整不够时进一个最小单位）；其它拒单（保证金不足等）按侧退避 2s → 4s → … 最长 60s，不会每轮重试烧额度。
 
-启动检查：签名私钥的 `userRole` 必须和 `HYPERLIQUID_ACCOUNT` 对得上（否则会出现"查 A 账户的仓位、在 B 账户下单"）；本机时钟偏差 > 15 秒拒绝启动；同一主账户只允许一个 `live`/`flatten` 进程。
+启动检查：签名私钥的 `userRole` 必须和 `HYPERLIQUID_ACCOUNT` 对得上（否则会出现"查 A 账户的仓位、在 B 账户下单"）；本机时钟偏差 > 15 秒拒绝启动；同一主账户只允许一个 `live`/`flatten` 进程（锁文件在 `~/.cache/entropy-bot/`，`flatten` 要用和服务相同的系统用户执行）；`COINS` 以外的币上有仓位会在启动时告警。
 
 Tick 从盘口买卖价增量推断，不用 `tick_size(mid)`。
 
@@ -293,7 +294,7 @@ Ctrl-C、SIGTERM（`systemctl stop`）或 `--seconds` 到时：
 
 平不掉或读不到仓位：日志 `STOP NOT FLAT` / `STOP NOT VERIFIED`，退出码 **3**，需要你手动处理。再按一次 Ctrl-C 会跳过等待（仍会撤单）。`STOP_FLATTEN_S=0` 恢复"只撤单"的旧行为，但有仓位仍会报错并以 3 退出。
 
-`kill -9`、OOM、断电等硬杀无法平仓：dead-man 在 `DEADMAN_AHEAD_S` 后撤单，仓位保留到下次启动（启动时发现仓位会先走平仓阶梯），或手动执行 `python -m entropy_bot flatten`。
+`kill -9`、OOM、断电等硬杀无法平仓：dead-man 在 `DEADMAN_AHEAD_S` 后撤单，仓位保留到下次启动（启动时发现仓位会先走平仓阶梯），或手动执行 `python -m entropy_bot flatten`（覆盖 ANTH 和 SNDK，不看 `COINS`；先停掉实盘进程）。
 
 ### 命令
 

@@ -63,7 +63,7 @@ class PositionClient(FakeClient):
 def clock(monkeypatch) -> Clock:
     c = Clock()
     monkeypatch.setattr("entropy_bot.live.time.time", c.time)
-    monkeypatch.setattr(LiveQuoter, "wait_for_book", lambda self, timeout: None)
+    monkeypatch.setattr(LiveQuoter, "_pause", lambda self, seconds: None)
     return c
 
 
@@ -229,9 +229,98 @@ def test_clock_skew_refused(monkeypatch):
 
 
 def test_single_instance_lock(tmp_path, monkeypatch):
-    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+    monkeypatch.setenv("ENTROPY_BOT_LOCK_DIR", str(tmp_path))
     first = acquire_instance_lock(MASTER)
     with pytest.raises(LiveGuardError):
         acquire_instance_lock(MASTER)
     first.close()
     acquire_instance_lock(MASTER).close()
+
+
+def test_wrong_kind_rest_is_canceled_even_when_reducer_cannot_go_out(markets, clock):
+    client = PositionClient(clock, 0.0)
+    q = _quoter(markets, client)
+    q.requote(SNDK, _top("1293.8", "1293.9", SNDK))  # flat: opening bid + opening ask
+    client.posts.clear()
+    # Partial bid fill → long; the reducer (A side) is in a reject cool-down.
+    q.pos[SNDK] = 0.0155
+    q.pos_since[SNDK] = clock.t
+    q._reject_until[(SNDK, "A")] = clock.t + 30
+    q.requote(SNDK, _top("1293.8", "1293.9", SNDK))
+    assert not q.rests[SNDK]["A"].occupied(), "full-size opening ask must not stay while long"
+    assert not q.rests[SNDK]["B"].occupied()
+    assert not _orders(client)
+
+
+def test_reducer_still_placed_during_weight_backoff(markets, clock):
+    from tests.test_live_throttle import WEIGHT_ERR
+
+    client = PositionClient(clock, 0.0)
+    q = _quoter(markets, client)
+    q._trip_weight_backoff(WEIGHT_ERR)
+    q.pos[SNDK] = 0.0386
+    q.pos_since[SNDK] = clock.t
+    client.szi = 0.0386
+    q.requote(SNDK, _top("1293.8", "1293.9", SNDK))
+    placed = _orders(client)
+    assert len(placed) == 1 and placed[0][-2] is True and placed[0][-1] == "Alo"
+
+
+def test_uncertain_deadman_renew_is_not_shortened(markets, clock):
+    from entropy_bot.errors import ExchangeUncertain
+
+    client = PositionClient(clock, 0.0)
+    client.exchange_error = ExchangeUncertain("read timed out")
+    q = _quoter(markets, client)
+    q.deadman_until = 0.0
+    q.maybe_deadman()
+    assert not [p for p in client.posts if p["action"].get("type") == "scheduleCancel"]
+    clock.advance(10.5)
+    q.maybe_deadman()
+    sent = [p["action"] for p in client.posts if p["action"].get("type") == "scheduleCancel"]
+    assert len(sent) == 1 and sent[0]["time"] >= int(clock.t * 1000) + 59_000
+
+
+def test_flatten_cli_covers_all_coins_and_checks_cleanup(markets, clock, monkeypatch, tmp_path):
+    import entropy_bot.flatten as flat_mod
+    from entropy_bot.coins import ALLOWED_COINS
+
+    class AnthClient(PositionClient):
+        def clearinghouse_state(self, *args: object, **kwargs: object) -> dict[str, Any]:
+            self.clock.advance(0.5)
+            rows = [{"position": {"coin": "io:ANTH", "szi": str(self.szi)}}] if self.szi else []
+            return {"assetPositions": rows}
+
+        def l2_book(self, coin: str) -> dict[str, Any]:
+            return _book_data("1985.0", "1985.1")
+
+        def post_info(self, payload: dict[str, Any], **_kw: Any) -> Any:
+            return {"role": "agent", "data": {"user": FakeSigner.account}}
+
+        def close(self) -> None:
+            pass
+
+    client = AnthClient(clock, 0.02)
+    seen: dict[str, Any] = {}
+
+    def fake_markets(_client, coins):
+        seen["coins"] = coins
+        return {}, {c: markets[c] for c in coins}, []
+
+    monkeypatch.setenv("ENTROPY_BOT_LOCK_DIR", str(tmp_path))
+    monkeypatch.setattr(flat_mod, "InfoClient", lambda *a, **k: client)
+    monkeypatch.setattr(flat_mod, "load_io_markets", fake_markets)
+    monkeypatch.setattr(flat_mod, "LiveSigner", lambda *a, **k: FakeSigner())
+    monkeypatch.setattr(flat_mod, "install_stop_handlers", lambda: {"flag": False, "count": 0})
+    settings = _settings(coins=(SNDK,))  # COINS is SNDK only; the ANTH position must still close
+    assert flat_mod.run_flatten(settings) == 0
+    assert seen["coins"] == ALLOWED_COINS
+    assert client.szi == 0
+
+    class NoOpens(AnthClient):
+        def open_orders(self, *args: object, **kwargs: object) -> None:
+            return None
+
+    client2 = NoOpens(clock, 0.0)
+    monkeypatch.setattr(flat_mod, "InfoClient", lambda *a, **k: client2)
+    assert flat_mod.run_flatten(settings) == 3  # cannot confirm bot orders are gone

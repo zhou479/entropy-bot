@@ -5,7 +5,7 @@ import pytest
 from entropy_bot.cli import main
 from entropy_bot.config import Settings, live_notional, require_live
 from entropy_bot.errors import LiveGuardError
-from entropy_bot.live import RestSlot, apply_open_orders, deadman_deadline_ms, empty_rests
+from entropy_bot.live import LiveQuoter, RestSlot, deadman_deadline_ms
 
 
 def _settings(**kwargs) -> Settings:
@@ -113,20 +113,15 @@ def test_live_notional_defaults_to_fifty():
 
 
 def test_open_orders_null_does_not_wipe_cache(markets):
-    rests = empty_rests(("io:ANTH", "io:SNDK"))
-    extras = {"io:ANTH": [], "io:SNDK": []}
-    rests["io:ANTH"]["B"] = RestSlot(oid=3_000_000_000, cloid="0x45424f54ab", px=1985.8)
-    kept, kept_ex = apply_open_orders(rests, extras, None, markets)
-    assert kept["io:ANTH"]["B"].oid == 3_000_000_000
-    assert kept_ex is extras
-    rebuilt, extras2 = apply_open_orders(
-        rests,
-        extras,
-        [{"coin": "io:ANTH", "oid": 3_000_000_001, "side": "B", "limitPx": "1985.8"}],
-        markets,
-    )
-    assert rebuilt["io:ANTH"]["B"].oid == 3_000_000_001
-    assert extras2["io:ANTH"] == []
+    class NullOpens:
+        def open_orders(self, *args, **kwargs):
+            return None
+
+    signer = type("Signer", (), {"account": "0x" + "11" * 20})()
+    q = LiveQuoter(_settings(live=True, private_key="0x" + "ab" * 32), markets, NullOpens(), signer)  # type: ignore[arg-type]
+    q.rests["io:ANTH"]["B"] = RestSlot(oid=3_000_000_000, cloid="0x45424f54ab", px=1985.8)
+    assert q.reconcile(force=True) is False
+    assert q.rests["io:ANTH"]["B"].oid == 3_000_000_000
 
 
 def test_deadman_clamped_to_at_least_five_seconds():

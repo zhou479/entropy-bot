@@ -123,13 +123,14 @@ def test_weight_backoff_still_sends_cancels_and_keeps_rests(markets, clock):
     q.requote(SNDK, _top("1294.8", "1294.9", SNDK))
     assert client.posts == []
     assert q._has_rest(SNDK)
-    # Position appears: the opening side must still be canceled during backoff.
+    # Position appears: the opening bid and the full-size opening ask are canceled,
+    # and a reduce-only reducer still goes out during the backoff.
     q.pos[SNDK] = 0.0386
     q.pos_since[SNDK] = clock.t
     q.requote(SNDK, _top("1294.8", "1294.9", SNDK))
-    assert ("cancel", 1) in _actions(client)
-    assert not any(k == "order" for k, _n in _actions(client))
+    assert _actions(client) == [("cancel", 2), ("order", 1)]
     assert not q.rests[SNDK]["B"].occupied()
+    assert q.rests[SNDK]["A"].reduce_only
 
 
 def test_deadman_renews_during_weight_backoff(markets, clock):

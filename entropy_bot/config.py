@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 
 from entropy_bot.coins import validate_coin_list
 from entropy_bot.errors import ConfigError, LiveGuardError
+from entropy_bot.precision import MIN_NOTIONAL_USD
 from entropy_bot.fees import (
     DEFAULT_ENTROPY_REFERRAL_REWARD,
     DEFAULT_ENTROPY_REFERRED_USER_BENEFIT,
@@ -25,7 +26,7 @@ DEFAULT_NOTIONAL = 50.0
 DEFAULT_OFFSET_TICKS = 2
 DEFAULT_MAX_LEVERAGE = 2
 DEFAULT_MIN_REPLACE_S = 12.0
-MIN_ORDER_USD = 10.0
+MIN_ORDER_USD = MIN_NOTIONAL_USD
 # Current ops: SNDK only. ANTH stays supported via COINS=io:ANTH,io:SNDK.
 DEFAULT_COINS: tuple[str, ...] = ("io:SNDK",)
 DEFAULT_RTH_ONLY_COINS: tuple[str, ...] = ("io:SNDK",)

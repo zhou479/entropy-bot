@@ -67,12 +67,6 @@ def wire_number(value: float) -> str:
     return text
 
 
-def size_from_notional(notional_usd: float, price: float, sz_decimals: int) -> float:
-    if price <= 0:
-        raise ValueError("price must be positive")
-    return floor_size(notional_usd / price, sz_decimals)
-
-
 def order_size(notional_usd: float, price: float, sz_decimals: int) -> float:
     """Size for ~`notional_usd`, never below the $10 exchange minimum at `price`.
 

@@ -377,7 +377,8 @@ def run_paper(settings: Settings, *, seconds: float | None = None) -> int:
         rc = run_quoter(quoter, feed, seconds=seconds, stop=stop)
     finally:
         if quoter is not None:
-            rc = rc or stop_cleanly(quoter, feed, settings, stop)
+            stop_rc = stop_cleanly(quoter, feed, settings, stop)
+            rc = rc or stop_rc
         elif feed is not None:
             feed.stop()
         if paper is not None:

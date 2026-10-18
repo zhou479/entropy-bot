@@ -85,7 +85,6 @@ MIN_STEP_S = 0.1
 DEADMAN_MIN_MS = 5_000
 DEADMAN_FALLBACK_MS = 6_000
 DEADMAN_REMAIN_LT_S = 8.0
-DEADMAN_REFRESH_S = DEADMAN_REMAIN_LT_S  # alias kept for callers of the old name
 DEADMAN_RETRY_S = 10.0
 IOC_GAP_S = 0.4
 IOC_GAP_MAX_S = 5.0
@@ -165,47 +164,6 @@ def _float_or_none(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return out if out > 0 else None
-
-
-def apply_open_orders(
-    rests: dict[str, dict[str, RestSlot]],
-    extras: dict[str, list[int]],
-    opens: list[dict[str, Any]] | None,
-    markets: dict[str, Market],
-) -> tuple[dict[str, dict[str, RestSlot]], dict[str, list[int]]]:
-    """Rebuild rest cache from frontendOpenOrders. None/429 must not wipe cache."""
-    if opens is None:
-        log.warning("open-order query null/429; keeping local rest cache")
-        return rests, extras
-    next_rests = empty_rests(tuple(markets))
-    next_extras: dict[str, list[int]] = {coin: [] for coin in markets}
-    for order in opens:
-        coin = match_order_coin(order, markets)
-        if coin is None or coin not in next_rests:
-            continue
-        oid_raw = order.get("oid", order.get("o"))
-        if oid_raw is None:
-            continue
-        try:
-            oid = as_oid(oid_raw)
-        except ValueError:
-            continue
-        is_buy = order_side_buy(order)
-        side = "B" if is_buy is True else "A" if is_buy is False else None
-        if side is None:
-            continue
-        slot = next_rests[coin][side]
-        cloid = order.get("cloid") or order.get("cloidStr")
-        if not slot.occupied():
-            slot.oid = oid
-            slot.cloid = cloid if isinstance(cloid, str) else None
-            slot.px = _float_or_none(order.get("limitPx") or order.get("px"))
-        else:
-            next_extras[coin].append(oid)
-    for coin, extra_oids in next_extras.items():
-        if extra_oids:
-            log.info("extra rests %s oids=%s", coin, extra_oids)
-    return next_rests, next_extras
 
 
 def reconcile_open_orders(
@@ -310,39 +268,6 @@ def foreign_open_orders(
         if order.get("isTrigger") or not is_bot_cloid(cloid if isinstance(cloid, str) else None):
             out.append(order)
     return out
-
-
-def list_cached_oids(
-    rests: dict[str, dict[str, RestSlot]],
-    extras: dict[str, list[int]],
-    coin: str,
-) -> list[int]:
-    out: list[int] = []
-    seen: set[int] = set()
-    for side in ("B", "A"):
-        slot = rests.get(coin, {}).get(side)
-        if slot and slot.oid is not None and slot.oid not in seen:
-            seen.add(slot.oid)
-            out.append(slot.oid)
-    for oid in extras.get(coin, []):
-        if oid not in seen:
-            seen.add(oid)
-            out.append(oid)
-    return out
-
-
-def list_cached_cloids(rests: dict[str, dict[str, RestSlot]], coin: str) -> list[str]:
-    """Cloids for slots that have no oid yet (an oid cancel already covers the rest)."""
-    out: list[str] = []
-    for side in ("B", "A"):
-        slot = rests.get(coin, {}).get(side)
-        if slot and slot.cloid and slot.oid is None:
-            out.append(slot.cloid)
-    return out
-
-
-def clear_coin_rests(rests: dict[str, dict[str, RestSlot]], coin: str) -> None:
-    rests[coin] = {"B": RestSlot(), "A": RestSlot()}
 
 
 def positions_from_state(
@@ -938,6 +863,14 @@ class LiveQuoter:
             self.extra_oids[coin] = []
         return True
 
+    def cancel_coin(self, coin: str) -> bool:
+        """Cancel every bot rest (and extra) on one coin. True when confirmed."""
+        sides = [s for s in ("B", "A") if side_occupied(self.rests, coin, s)]
+        extras = list(self.extra_oids.get(coin, []))
+        if not sides and not extras:
+            return True
+        return self._cancel(coin, sides, extras)
+
     def _note_reject(self, coin: str, side: str, now: float) -> float:
         key = (coin, side)
         streak = self._reject_streak.get(key, 0)
@@ -1048,7 +981,9 @@ class LiveQuoter:
         deadline = deadman_deadline_ms(ahead)
         try:
             resp = self._post(self.signer.signed_schedule_cancel(deadline), essential=True)
-        except RequestWeightLimited:
+        except (RequestWeightLimited, ExchangeUncertain):
+            # Uncertain: it may have landed at +ahead. A +6s fallback on top could
+            # fire the account-wide cancel; retry the full horizon instead.
             raise
         except RateLimited:
             fallback = deadman_deadline_ms(DEADMAN_FALLBACK_MS)
@@ -1131,9 +1066,7 @@ class LiveQuoter:
         if now - self.last_take_at.get(coin, 0.0) < gap:
             return
         log.info("flatten take %s age=%.1fs szi=%s", coin, plan.age_ms / 1000, plan.szi)
-        occupied = [s for s in ("B", "A") if side_occupied(self.rests, coin, s)]
-        extras = list(self.extra_oids.get(coin, []))
-        if (occupied or extras) and not self._cancel(coin, occupied, extras):
+        if not self.cancel_coin(coin):
             log.warning("cancel before IOC failed %s; retry next step", coin)
             return
         self.last_take_at[coin] = now
@@ -1168,6 +1101,7 @@ class LiveQuoter:
         paused = self._opening_writes_paused()
         unknown = self._needs_reconcile.get(coin, False)
         cancel_sides: list[str] = []
+        must_cancel: set[str] = set()  # wrong-kind rests: cancel even if the replacement can't go out
         place: list[QuoteIntent] = []
         replacing = False
         held = False
@@ -1183,6 +1117,7 @@ class LiveQuoter:
                     continue
                 # Opening side while in a position, or quoting is off: never leave it.
                 cancel_sides.append(side)
+                must_cancel.add(side)
                 continue
             verdict = slot_verdict(
                 slot,
@@ -1199,24 +1134,26 @@ class LiveQuoter:
                 held = True
                 continue
             cancel_sides.append(side)
+            if verdict == "now":
+                must_cancel.add(side)
             place.append(want)
             replacing = True
-        # Placement gates: never stack orders on an unknown book, respect ALO
-        # reject cool-down, and hold new opening quotes while writes are paused.
+        # Placement gates: never stack orders on an unknown book, respect reject
+        # cool-downs, and hold new opening quotes while writes are paused
+        # (weight backoff included). Reduce-only reducers always may go out.
         allowed: list[QuoteIntent] = []
         for intent in place:
             if unknown:
                 continue
             if now < self._reject_until.get((coin, intent.side), 0.0):
                 continue
-            if self._in_weight_backoff():
-                continue
             if paused and not intent.reduce_only:
                 continue
             allowed.append(intent)
         dropped = {i.side for i in place} - {i.side for i in allowed}
-        # A replacement whose new order cannot go out keeps its old rest.
-        cancel_sides = [s for s in cancel_sides if s not in dropped or s not in desired]
+        # A price-only replacement whose new order cannot go out keeps its old
+        # rest; a wrong-kind rest (e.g. a full-size opening ask while long) never stays.
+        cancel_sides = [s for s in cancel_sides if s not in dropped or s in must_cancel]
         if held and not self._replace_skip_logged.get(coin):
             log.info(
                 "min-replace: keep %s rests (%.1fs < %.0fs); take still allowed",
@@ -1338,10 +1275,7 @@ class LiveQuoter:
                 try:
                     szi = self.pos.get(coin, 0.0)
                     if abs(szi) <= EPS:
-                        sides = [s for s in ("B", "A") if side_occupied(self.rests, coin, s)]
-                        extras = list(self.extra_oids.get(coin, []))
-                        if sides or extras:
-                            self._cancel(coin, sides, extras)
+                        self.cancel_coin(coin)
                         continue
                     top = self.book_for(coin, feed)
                     if top is None or top.bid is None or top.ask is None:
@@ -1350,7 +1284,11 @@ class LiveQuoter:
                     self._take(coin, self._exit_plan(coin, top, szi))
                 except Exception as exc:  # noqa: BLE001
                     log.warning("stop flatten %s: %s", coin, exc)
-            self.wait_for_book(STOP_POLL_S)
+            self._pause(STOP_POLL_S)
+
+    def _pause(self, seconds: float) -> None:
+        # Fixed pace, not book-driven: each pass forces a clearinghouseState read.
+        time.sleep(seconds)
 
     def shutdown_cancels(self) -> bool:
         """Cancel every rest on this bot's coins, then clear (or shorten) the dead-man.
@@ -1362,9 +1300,7 @@ class LiveQuoter:
         if not self.reconcile(force=True):
             clean = False
         for coin in self.markets:
-            sides = [s for s in ("B", "A") if side_occupied(self.rests, coin, s)]
-            extras = list(self.extra_oids.get(coin, []))
-            if (sides or extras) and not self._cancel(coin, sides, extras):
+            if not self.cancel_coin(coin):
                 clean = False
         if clean:
             self.clear_deadman()
@@ -1532,9 +1468,12 @@ def acquire_instance_lock(account: str) -> Any:
     """One live/flatten process per master account (two would fight over the same rests)."""
     import fcntl
     import os
-    import tempfile
 
-    path = os.path.join(tempfile.gettempdir(), f"entropy-bot-{account.lower()}.lock")
+    # Not /tmp: systemd PrivateTmp would give the service its own /tmp and a
+    # `flatten` from a shell would never see the live bot's lock.
+    lock_dir = os.environ.get("ENTROPY_BOT_LOCK_DIR") or os.path.join(os.path.expanduser("~"), ".cache", "entropy-bot")
+    os.makedirs(lock_dir, exist_ok=True)
+    path = os.path.join(lock_dir, f"{account.lower()}.lock")
     handle = open(path, "w")  # noqa: SIM115 - held for the life of the process
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1613,6 +1552,16 @@ def run_live(settings: Settings, *, seconds: float | None = None) -> int:
         user_state = client.clearinghouse_state(signer.account, ALLOWED_DEX, optional=True)
         if user_state:
             log.info("isolated user state withdrawable=%s", user_state.get("withdrawable"))
+            for item in user_state.get("assetPositions") or []:
+                pos = (item or {}).get("position") or {}
+                if pos.get("coin") not in markets and _float_or_none(abs(float(pos.get("szi") or 0))):
+                    log.warning(
+                        "open position on %s (szi=%s) is NOT managed by this run (COINS=%s); "
+                        "`python -m entropy_bot flatten` closes it",
+                        pos.get("coin"),
+                        pos.get("szi"),
+                        ",".join(settings.coins),
+                    )
         quoter = LiveQuoter(settings, markets, client, signer)
         if user_state:
             parsed = positions_from_state(user_state, tuple(markets), markets)
