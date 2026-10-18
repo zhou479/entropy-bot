@@ -46,7 +46,7 @@ from entropy_bot.quoting import (
     sync_pos_since,
 )
 from entropy_bot.diagnostics import BookSnap, FillDiagnostics, snap_from_top
-from entropy_bot.errors import (ExchangeOutcomeUnknown, LiveGuardError, RateLimited,
+from entropy_bot.errors import (LiveGuardError, RateLimited,
                                 RequestWeightLimited, is_weight_limit_error)
 from entropy_bot.safety import (BUDGET_POLL_S, HTTP_BACKOFF_S, LIMITED_EXIT_GAP_S,
                                 RequestBudget, cancel_confirmed)

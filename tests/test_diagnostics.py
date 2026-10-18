@@ -21,8 +21,6 @@ NY = ZoneInfo("America/New_York")
 
 
 def _snap(mid: float, *, age: float = 0.1, spread: float = 0.2) -> BookSnap:
-    bid = mid - spread / 2.0
-    ask = mid + spread / 2.0
     return BookSnap(mid=mid, spread=spread, spread_bps=(spread / mid) * 10_000.0, age_s=age)
 
 

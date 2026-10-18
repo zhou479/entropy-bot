@@ -9,7 +9,7 @@ import pytest
 from entropy_bot.errors import LiveGuardError
 from entropy_bot.live import LiveQuoter
 from entropy_bot.paper import PaperExchange, PaperSigner
-from test_live_throttle import Clock, FakeClient, FakeSigner, _book_data, _settings
+from test_live_throttle import Clock, FakeClient, FakeSigner, _settings
 
 SNDK = "io:SNDK"
 ANTH = "io:ANTH"

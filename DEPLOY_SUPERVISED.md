@@ -22,7 +22,7 @@
 
 ```bash
 sudo install -d -o entropybot -g entropybot -m 750 /opt/entropy-bot-supervised
-sudo -u entropybot -H git clone --branch fix/supervised-sessions --single-branch https://github.com/zhou479/entropy-bot.git /opt/entropy-bot-supervised/repo
+sudo -u entropybot -H git clone --branch main https://github.com/zhou479/entropy-bot.git /opt/entropy-bot-supervised/repo
 sudo -u entropybot -H python3 -m venv /opt/entropy-bot-supervised/repo/.venv
 sudo -u entropybot -H /bin/bash -c 'cd /opt/entropy-bot-supervised/repo && .venv/bin/python -m pip install -c constraints-tested.txt -e ".[dev]"'
 sudo -u entropybot -H /opt/entropy-bot-supervised/repo/.venv/bin/python -m pip check
@@ -37,7 +37,23 @@ sudo apt-get update
 sudo apt-get install python3-venv tmux util-linux
 ```
 
-关键是 clone 命令里的 `--branch fix/supervised-sessions`：默认 main 不是这个修复分支。
+`main` 就是这套值守版本（原 `fix/supervised-sessions` 已合入 main）。
+
+### 已经按旧分支部署过的服务器：升级
+
+先确认机器人没在运行（tmux 里没有会话，或已正常退出），再执行：
+
+```bash
+cd /opt/entropy-bot-supervised/repo
+sudo -u entropybot -H git remote set-branches origin main   # 旧 clone 用了 --single-branch
+sudo -u entropybot -H git fetch origin main
+sudo -u entropybot -H git checkout main
+sudo -u entropybot -H git pull --ff-only origin main
+sudo -u entropybot -H /bin/bash -c '.venv/bin/python -m pip install -c constraints-tested.txt -e ".[dev]" && .venv/bin/python -m pip check'
+sudo -u entropybot -H /bin/bash -c 'PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -B -m pytest -p no:cacheprovider'
+```
+
+想回到某个已验证的版本：`git checkout <tag>`（例如 `v0.2.1` 是 2026-10 之前一直在用的值守版本），用法同上。
 
 ## 核对配置
 
@@ -60,6 +76,18 @@ ENTROPY_REFERRAL_REWARD=0.25
 ENTROPY_REFERRED_USER_BENEFIT=0
 ```
 
+下面这些是可选项，不写就用括号里的默认值：
+
+```dotenv
+REQUOTE_TOLERANCE_TICKS=1   # 挂单离目标价不超过 1 tick 就不动（0 = 任何变动都重挂）
+STALE_QUOTE_S=120           # 空仓挂单多久没动刷新一次（原固定 45 秒；0 = 关闭）
+TAKE_SLIPPAGE_TICKS=0       # 15 秒后的减仓 IOC 多穿几个 tick（0 = 原行为）
+MAX_POSITION_USD=           # 仓位名义达到多少直接 IOC（空 = 3 x QUOTE_NOTIONAL_USD）
+ORACLE_MAX_DEV_BPS=50       # 盘口偏离 oracle 超过多少 bp 暂停开仓（0 = 关闭）
+RTH_ONLY_COINS=             # 只在纽约正常交易时段开仓的币，例如 io:SNDK（空 = 不限）
+MAX_SESSION_LOSS_USD=0      # 本次运行已实现净亏损达到多少美元就收尾退出（0 = 关闭）
+```
+
 这里按此前核对的账户费率配置，不代表所有人的等级。费率字段只参与费用估算，不改变平台实际费率或返佣资格；权益变化时需要重新核对。200 USDC 是你计划存入的账户本金，不是一个新的配置字段。每侧 50 USDC 是名义金额，不是亏损上限。
 
 配置中的 `LIVE=0` 可以保留。启动脚本只有在你当次输入 RUN 后才对该进程设置 `LIVE=1`。源配置仍为 0，可减少误启动风险。
@@ -72,7 +100,7 @@ ENTROPY_REFERRED_USER_BENEFIT=0
 sudo -u entropybot -H /bin/bash -c 'set -a; . /etc/entropy-bot/entropy-live.env; set +a; export LIVE=0 HYPERLIQUID_PRIVATE_KEY=; cd /opt/entropy-bot-supervised/repo; exec .venv/bin/python -m entropy_bot paper --seconds 60'
 ```
 
-paper 通过只能说明行情连接和基本计算路径可用，不能验证成交、亏损或实盘清理。第一次新版实盘先做 300 秒检查。可以在 entropybot 的 tmux 会话中运行，避免笔记本关盖直接中断 SSH：
+paper 跑的是和实盘完全相同的值守会话流程（报价、两侧管理、平仓阶梯、到时收尾），只把交易所换成本地模拟撮合，不签名、不发单。结束时有一行 `PAPER SUMMARY`（成交、成交额、已实现盈亏、换成实盘要花多少次签名请求），最后应看到 `SESSION DONE` 和 `SHUTDOWN confirmed flat`。模拟撮合很简单（盘口穿过挂单价就算成交），成交率偏乐观，不能代替真实成交、亏损或实盘清理的验证。第一次新版实盘先做 300 秒检查。可以在 entropybot 的 tmux 会话中运行，避免笔记本关盖直接中断 SSH：
 
 ```bash
 sudo -u entropybot -H tmux new-session -s entropy-live
@@ -87,6 +115,14 @@ bash /opt/entropy-bot-supervised/repo/scripts/run-supervised.sh 300
 看清屏幕显示的币种、金额和杠杆，输入 `RUN` 回车，才会开始真实交易。没有输入、输入不匹配或 60 秒超时都不交易。Xterminal 重放命令时也会重新等待确认。
 
 这次退出后，应看见 `SESSION DONE` 和 `SHUTDOWN confirmed flat`，再去网页核对持仓为零、挂单为空。若有 `SAFETY STOP` / `cleanup timed out` / `SHUTDOWN NOT CLEAN`，先处理残留，不要盲目重启。
+
+处理残留可以在网页上手动平仓，也可以用紧急平仓命令（会话必须已经退出，否则它会因为运行锁拒绝执行）：
+
+```bash
+sudo -u entropybot -H /bin/bash -c 'set -a; . /etc/entropy-bot/entropy-live.env; set +a; cd /opt/entropy-bot-supervised/repo; exec .venv/bin/python -m entropy_bot flatten'
+```
+
+它只撤本机器人（EBOT 标记）的挂单，用 reduce-only IOC 平掉 io:ANTH 和 io:SNDK 的仓位（不看 `COINS`），你手动挂的单和止盈止损单不动；要输入 `FLATTEN` 确认；交易所报告无仓位、无机器人挂单才返回 0，否则 60 秒后返回 3，需要你去网页处理。
 
 检查正常后，每天手动选择其中一个命令（不要一起运行）：
 
