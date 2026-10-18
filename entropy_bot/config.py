@@ -24,6 +24,8 @@ DEFAULT_NOTIONAL = 50.0
 DEFAULT_OFFSET_TICKS = 2
 DEFAULT_MAX_LEVERAGE = 2
 DEFAULT_MIN_REPLACE_S = 12.0
+DEFAULT_REQUOTE_TOLERANCE_TICKS = 1
+DEFAULT_STALE_QUOTE_S = 120.0
 MIN_ORDER_USD = 10.0
 
 
@@ -46,6 +48,10 @@ class Settings:
     entropy_referral_reward: float = DEFAULT_ENTROPY_REFERRAL_REWARD
     entropy_referred_user_benefit: float = DEFAULT_ENTROPY_REFERRED_USER_BENEFIT
     min_replace_s: float = DEFAULT_MIN_REPLACE_S
+    # 挂单离目标价不超过 N 个 tick 就不动（省写请求、保留排队位置）。0 = 任何变动都重挂。
+    requote_tolerance_ticks: int = DEFAULT_REQUOTE_TOLERANCE_TICKS
+    # 空仓挂单超过 N 秒价格没变也刷新一次。0 = 关闭。（原固定 45 秒）
+    stale_quote_s: float = DEFAULT_STALE_QUOTE_S
 
     @property
     def paper(self) -> bool:
@@ -89,12 +95,16 @@ def load_settings(dotenv_path: str | Path | None = None) -> Settings:
             float(referred_raw) if referred_raw is not None else DEFAULT_ENTROPY_REFERRED_USER_BENEFIT
         )
         min_replace_s = float(os.environ.get("MIN_REPLACE_S", DEFAULT_MIN_REPLACE_S))
+        tol_ticks = int(os.environ.get("REQUOTE_TOLERANCE_TICKS", DEFAULT_REQUOTE_TOLERANCE_TICKS))
+        stale_quote_s = float(os.environ.get("STALE_QUOTE_S", DEFAULT_STALE_QUOTE_S))
     except ValueError as exc:
         raise ConfigError(f"invalid numeric config: {exc}") from exc
     if notional <= 0 or offset < 0 or max_lev < 1:
         raise ConfigError("QUOTE_NOTIONAL_USD, QUOTE_OFFSET_TICKS, MAX_LEVERAGE must be positive")
     if min_replace_s < 0:
         raise ConfigError("MIN_REPLACE_S must be >= 0")
+    if tol_ticks < 0 or stale_quote_s < 0:
+        raise ConfigError("REQUOTE_TOLERANCE_TICKS and STALE_QUOTE_S must be >= 0")
     rates_for_tier(fee_tier)
     entropy_program(entropy_tier)
     if not 0.0 <= referral < 1.0:
@@ -123,6 +133,8 @@ def load_settings(dotenv_path: str | Path | None = None) -> Settings:
         entropy_referral_reward=entropy_referral_reward,
         entropy_referred_user_benefit=entropy_referred,
         min_replace_s=min_replace_s,
+        requote_tolerance_ticks=tol_ticks,
+        stale_quote_s=stale_quote_s,
     )
 
 
